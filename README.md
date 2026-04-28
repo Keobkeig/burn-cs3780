@@ -1,4 +1,4 @@
-# 🔥 Burn CS3780: Machine Learning Framework
+#  Burn CS3780: Machine Learning Framework
 
 A comprehensive machine learning library implementing all CS3780 concepts using the **Burn** deep learning framework. This project demonstrates how to build production-quality machine learning algorithms from scratch using Rust's powerful type system and Burn's flexible tensor operations.
 
@@ -6,7 +6,7 @@ A comprehensive machine learning library implementing all CS3780 concepts using 
 [![Burn](https://img.shields.io/badge/burn-0.20-red.svg)](https://burn.dev)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 🚀 Features
+## Features
 
 ### Classical Machine Learning
 - **k-Nearest Neighbors (k-NN)** - Classification and regression with multiple distance metrics
@@ -38,21 +38,7 @@ A comprehensive machine learning library implementing all CS3780 concepts using 
 - **Cross-Validation** - Model selection and hyperparameter tuning
 - **Regularization** - L1/L2 regularization and early stopping
 
-## 🏗️ Architecture
-
-### Backend Flexibility
-Thanks to Burn's backend system, all algorithms can run on:
-- **CPU** (NdArray backend) - For development and small datasets
-- **GPU** (WGPU backend) - For high-performance training  
-- **WebAssembly** - For browser deployment and interactive demos
-
-### Type Safety
-Leverages Rust's type system for:
-- Compile-time tensor shape verification
-- Memory safety without garbage collection
-- Zero-cost abstractions for optimal performance
-
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 - Rust 1.75 or later
@@ -139,7 +125,7 @@ let trained_model = model.fit(&train_data, 100, 32).unwrap();
 let predictions = trained_model.predict(&test_data);
 ```
 
-## 🧪 Running Examples
+##  Running Examples
 
 ### Available Examples
 
@@ -183,7 +169,7 @@ cargo run --bin perceptron_example -- --demo --visualize
 cargo run --bin comparison_example
 ```
 
-## 📊 Datasets
+##  Datasets
 
 The library includes generators for common ML datasets:
 
@@ -204,7 +190,7 @@ let poly_data = datasets::make_polynomial_regression::<Backend>(100, 3, 0.2, &de
 let cluster_data = datasets::make_blobs::<Backend>(300, 4, 1.5, &device, Some(123));
 ```
 
-## 🔧 Configuration
+##  Configuration
 
 ### Backend Selection
 
@@ -229,7 +215,7 @@ type GpuBackend = burn::backend::Autodiff<burn::backend::Wgpu<f32>>;
 let mut knn = KNearestNeighbors::<GpuBackend>::new(5);
 ```
 
-## 🧮 Mathematical Foundation
+##  Mathematical Foundation
 
 ### Algorithms Implemented
 
@@ -251,7 +237,7 @@ let mut knn = KNearestNeighbors::<GpuBackend>::new(5);
 - **Learning Rate Scheduling**: Step decay, exponential decay, cosine annealing
 - **Regularization**: L1 (Lasso), L2 (Ridge), ElasticNet, dropout
 
-## 🎯 Performance
+## Performance
 
 ### Benchmarks
 
@@ -268,7 +254,7 @@ Thanks to Burn's tensor operations and Rust's zero-cost abstractions:
 - **Cache efficiency**: Optimized memory access patterns  
 - **Vectorized operations**: SIMD instructions when available
 
-## 🌐 Web Deployment
+##  Web Deployment
 
 Deploy models to the browser using WebAssembly:
 
@@ -283,7 +269,7 @@ python -m http.server 8000
 
 See `examples/mnist-inference-web/` for a complete browser demo.
 
-## 🧪 Testing
+##  Testing
 
 Comprehensive test suite covering:
 
@@ -298,33 +284,7 @@ cargo test --doc             # Run documentation tests
 cargo test models::knn       # Run specific module tests
 ```
 
-## 📚 Educational Resources
-
-### Course Alignment
-
-This implementation follows the CS3780 curriculum:
-
-| Week | Topic | Implementation |
-|------|-------|----------------|
-| 1-2 | Introduction, k-NN | `models::knn` |
-| 3-4 | Decision Trees | `models::decision_tree` |
-| 5-6 | Linear Models | `models::linear_models` |
-| 7-8 | Perceptron, SVM | `models::perceptron`, `models::svm` |
-| 9-10 | Kernel Methods | `kernels::*` |
-| 11-12 | Neural Networks | `models::neural_networks` |
-| 13-14 | Deep Learning | `models::transformers`, `models::autoencoders` |
-| 15-16 | Ensemble Methods | `models::boosting` |
-
-### Learning Path
-
-1. **Start with k-NN**: Understand distance metrics and lazy learning
-2. **Linear Models**: Learn optimization and regularization
-3. **Perceptron**: Understand linear separability and convergence
-4. **Kernels & SVM**: Explore non-linear transformations
-5. **Neural Networks**: Build up to deep learning
-6. **Advanced Topics**: Transformers, autoencoders, ensembles
-
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -359,18 +319,12 @@ cargo clippy
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - **Burn Team** - For the excellent deep learning framework
 - **CS3780 Course** - For the comprehensive ML curriculum  
 - **Rust Community** - For the amazing ecosystem
 
-## 📞 Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-username/burn-cs3780/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-username/burn-cs3780/discussions)
-- **Email**: your-email@domain.com
-
 ---
 
-**Happy Learning! 🔥🦀**
+**Happy Learning! **

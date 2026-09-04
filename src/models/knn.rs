@@ -85,55 +85,71 @@ impl<B: Backend<FloatElem = f32>> KNearestNeighbors<B> {
         self.y_train = Some(y_train);
     }
 
+    /// Pairwise distances from every test row to every training row.
+    fn distances(&self, x_test: &Tensor<B, 2>, x_train: &Tensor<B, 2>) -> Tensor<B, 2> {
+        match self.distance_metric {
+            DistanceMetric::Euclidean => Distance::pairwise_euclidean(x_test, x_train),
+            DistanceMetric::Manhattan => Distance::pairwise_manhattan(x_test, x_train),
+            DistanceMetric::Cosine => Distance::pairwise_cosine(x_test, x_train),
+        }
+    }
+
     /// Predict for new samples
+    ///
+    /// The distance matrix is computed in one vectorized pass and the k
+    /// smallest per row are selected on the CPU. Doing it a pair at a time
+    /// means one tensor allocation per (test, train) combination, which for a
+    /// mesh of a few thousand points is hundreds of thousands of allocations
+    /// and no arithmetic worth speaking of.
     pub fn predict(&self, x_test: &Tensor<B, 2>) -> Tensor<B, 1> {
         let x_train = self.x_train.as_ref().expect("Model not fitted");
         let y_train = self.y_train.as_ref().expect("Model not fitted");
 
         let n_test = x_test.dims()[0];
+        let n_train = x_train.dims()[0];
+        if n_train == 0 {
+            return Tensor::zeros([n_test], &x_test.device());
+        }
+
+        let distances = self
+            .distances(x_test, x_train)
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap_or_default();
+        let labels = y_train
+            .clone()
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap_or_default();
+
+        let k = self.k.clamp(1, n_train);
         let mut predictions = Vec::with_capacity(n_test);
+        let mut row: Vec<(f32, f32, usize)> = Vec::with_capacity(n_train);
 
         for i in 0..n_test {
-            let test_sample = x_test.clone().slice([i..i + 1]).squeeze::<1>();
-            let prediction = self.predict_single(&test_sample, x_train, y_train);
-            predictions.push(prediction);
+            row.clear();
+            row.extend((0..n_train).map(|j| (distances[i * n_train + j], labels[j], j)));
+
+            // Only the k nearest need ordering, so partition first.
+            let order = |a: &(f32, f32, usize), b: &(f32, f32, usize)| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            };
+            if k < n_train {
+                row.select_nth_unstable_by(k, order);
+            }
+            let neighbors = &mut row[..k];
+            neighbors.sort_by(order);
+
+            predictions.push(if self.is_classification {
+                self.predict_classification(neighbors)
+            } else {
+                self.predict_regression(neighbors)
+            });
         }
 
         Tensor::from_floats(predictions.as_slice(), &x_test.device())
-    }
-
-    /// Predict for a single sample
-    fn predict_single(
-        &self,
-        test_sample: &Tensor<B, 1>,
-        x_train: &Tensor<B, 2>,
-        y_train: &Tensor<B, 1>,
-    ) -> f32 {
-        let n_train = x_train.dims()[0];
-
-        // Compute distances to all training samples
-        let mut distances_with_indices = Vec::with_capacity(n_train);
-
-        for i in 0..n_train {
-            let train_sample = x_train.clone().slice([i..i + 1]).squeeze::<1>();
-            let distance = self.compute_distance(test_sample, &train_sample);
-            let label: f32 = y_train
-                .clone()
-                .slice([i..i + 1])
-                .squeeze::<1>()
-                .into_scalar();
-            distances_with_indices.push((distance, label, i));
-        }
-
-        // Sort by distance and take k nearest neighbors
-        distances_with_indices.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let k_neighbors = &distances_with_indices[..self.k.min(n_train)];
-
-        if self.is_classification {
-            self.predict_classification(k_neighbors)
-        } else {
-            self.predict_regression(k_neighbors)
-        }
     }
 
     /// Predict for classification (majority vote)
@@ -207,11 +223,7 @@ impl<B: Backend<FloatElem = f32>> KNearestNeighbors<B> {
         for i in 0..n_train {
             let train_sample = x_train.clone().slice([i..i + 1]).squeeze::<1>();
             let distance = self.compute_distance(test_sample, &train_sample);
-            let label: f32 = y_train
-                .clone()
-                .slice([i..i + 1])
-                .squeeze::<1>()
-                .into_scalar();
+            let label: f32 = y_train.clone().slice([i..i + 1]).into_scalar();
             distances_with_indices.push((distance, label, i));
         }
 
@@ -356,13 +368,19 @@ mod tests {
         let (train_data, test_data) = dataset.train_test_split(0.8, Some(42));
 
         let mut knn = KNearestNeighbors::new(3);
-        knn.fit(train_data.features, train_data.labels.squeeze(1));
+        knn.fit(
+            train_data.features,
+            train_data.labels.squeeze_dims::<1>(&[1]),
+        );
 
         let predictions = knn.predict(&test_data.features);
 
         // Should have reasonable accuracy on linearly separable data
         use crate::metrics::ClassificationMetrics;
-        let accuracy = ClassificationMetrics::accuracy(&test_data.labels.squeeze(1), &predictions);
+        let accuracy = ClassificationMetrics::accuracy(
+            &test_data.labels.squeeze_dims::<1>(&[1]),
+            &predictions,
+        );
         assert!(
             accuracy > 0.7,
             "Accuracy should be > 70% on linearly separable data"
@@ -379,13 +397,16 @@ mod tests {
         let (train_data, test_data) = dataset.train_test_split(0.8, Some(42));
 
         let mut knn = KNearestNeighbors::new_regressor(5);
-        knn.fit(train_data.features, train_data.labels.squeeze(1));
+        knn.fit(
+            train_data.features,
+            train_data.labels.squeeze_dims::<1>(&[1]),
+        );
 
         let predictions = knn.predict(&test_data.features);
 
         // Should have reasonable MSE
         use crate::metrics::RegressionMetrics;
-        let mse = RegressionMetrics::mse(&test_data.labels.squeeze(1), &predictions);
+        let mse = RegressionMetrics::mse(&test_data.labels.squeeze_dims::<1>(&[1]), &predictions);
         assert!(mse < 1.0, "MSE should be reasonable for polynomial data");
     }
 
@@ -403,7 +424,7 @@ mod tests {
             let mut knn = KNearestNeighbors::new(3).with_distance_metric(metric);
             knn.fit(
                 train_data.features.clone(),
-                train_data.labels.clone().squeeze(1),
+                train_data.labels.clone().squeeze_dims::<1>(&[1]),
             );
 
             let predictions = knn.predict(&test_data.features);

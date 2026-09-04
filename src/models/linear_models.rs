@@ -4,7 +4,7 @@
 //! regularization techniques (Ridge, Lasso, Elastic Net).
 
 use crate::optimizers::{Adam, Optimizer, SGD};
-use burn::tensor::{backend::Backend, Tensor};
+use burn::tensor::{backend::Backend, Tensor, TensorData};
 use std::marker::PhantomData;
 
 /// Linear Regression model
@@ -150,29 +150,52 @@ impl<B: Backend<FloatElem = f32>> LinearRegression<B> {
         self.solve_linear_system(&regularized_xtx, &xty)
     }
 
-    /// Simplified linear system solver (placeholder for proper implementation)
+    /// Solve `Aw = b` exactly.
+    ///
+    /// Falls back to the iterative solver if `A` turns out singular — which
+    /// happens with perfectly collinear features.
     fn solve_linear_system(&self, a: &Tensor<B, 2>, b: &Tensor<B, 1>) -> Tensor<B, 1> {
-        // This is a simplified implementation
-        // In practice, you'd use LU decomposition, Cholesky, or iterative methods
+        let n = a.dims()[0];
+        let a_data = a
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap_or_default();
+        let b_data = b
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap_or_default();
 
-        // For now, we'll use gradient descent as fallback
+        match crate::utils::MathUtils::solve_linear_system(&a_data, &b_data, n) {
+            Some(solution) => Tensor::from_data(TensorData::new(solution, [n]), &a.device()),
+            None => self.solve_gradient_descent(a, b),
+        }
+    }
+
+    /// Last-resort solver for singular systems: plain gradient descent on
+    /// `\|Aw - b\|^2` with a step size scaled to the largest row sum, so it
+    /// cannot diverge the way a fixed step size does.
+    fn solve_gradient_descent(&self, a: &Tensor<B, 2>, b: &Tensor<B, 1>) -> Tensor<B, 1> {
         let n_features = a.dims()[0];
         let mut weights = Tensor::<B, 1>::zeros([n_features], &a.device());
-        let learning_rate = 0.01;
-        let max_iter = 1000;
 
-        for _ in 0..max_iter {
+        // A bound on the spectral norm; keeps the step inside the stable range.
+        let scale = a.clone().abs().sum_dim(1).max().into_scalar().max(1e-6);
+        let learning_rate = 1.0 / scale;
+
+        for _ in 0..2000 {
             let pred = a
                 .clone()
                 .matmul(weights.clone().unsqueeze_dim(1))
-                .squeeze::<1>();
+                .reshape([n_features]);
             let residual = pred.sub(b.clone());
             let gradient = a
                 .clone()
                 .transpose()
                 .matmul(residual.unsqueeze_dim(1))
-                .squeeze::<1>();
-            weights = weights.sub(gradient.mul_scalar(learning_rate));
+                .reshape([n_features]);
+            weights = weights.sub(gradient.mul_scalar(learning_rate / scale));
         }
 
         weights
@@ -266,7 +289,7 @@ impl<B: Backend<FloatElem = f32>> LinearRegression<B> {
         if self.fit_intercept {
             self.weights
                 .as_ref()
-                .map(|w| w.clone().slice([0..1]).squeeze::<1>().into_scalar())
+                .map(|w| w.clone().slice([0..1]).into_scalar())
         } else {
             None
         }
@@ -496,7 +519,7 @@ impl<B: Backend<FloatElem = f32>> LogisticRegression<B> {
         if self.fit_intercept {
             self.weights
                 .as_ref()
-                .map(|w| w.clone().slice([0..1]).squeeze::<1>().into_scalar())
+                .map(|w| w.clone().slice([0..1]).into_scalar())
         } else {
             None
         }

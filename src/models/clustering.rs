@@ -4,6 +4,7 @@
 //! using the Burn framework.
 
 use burn::tensor::{backend::Backend, Device, Tensor, TensorData};
+use rand::{Rng, SeedableRng};
 
 /// Type alias for the default backend (CPU) used in clustering
 type DefaultBackend = burn::backend::NdArray<f32>;
@@ -37,24 +38,18 @@ impl ClusteringDistanceMetric {
         points: &Tensor<B, 2>,
         centroids: &Tensor<B, 2>,
     ) -> Tensor<B, 2> {
-        match self {
-            ClusteringDistanceMetric::Euclidean => {
-                // Compute squared Euclidean distances using broadcasting
-                let n_points = points.dims()[0];
-                let n_centroids = centroids.dims()[0];
+        // Every variant currently uses Euclidean distance.
+        // ponytail: Manhattan/Cosine fall back to Euclidean; implement them here
+        // if a demo ever needs a metric that changes the cluster shapes.
+        // sum_dim keeps the reduced axis, so these are already rank 2:
+        // [n, 1] and [1, k]. Broadcasting handles the rest.
+        let points_squared = points.clone().powf_scalar(2.0).sum_dim(1);
+        let centroids_squared = centroids.clone().powf_scalar(2.0).sum_dim(1).transpose();
+        let cross_term = points.clone().matmul(centroids.clone().transpose());
 
-                let points_squared = points.clone().powf_scalar(2.0).sum_dim(1);
-                let centroids_squared = centroids.clone().powf_scalar(2.0).sum_dim(1);
-                let cross_term = points.clone().matmul(centroids.clone().transpose());
-
-                let points_squared = points_squared.unsqueeze_dim(1).repeat_dim(1, n_centroids);
-                let centroids_squared = centroids_squared.unsqueeze_dim(0).repeat_dim(0, n_points);
-
-                (points_squared + centroids_squared - cross_term.mul_scalar(2.0)).sqrt()
-            }
-            // For simplicity, use Euclidean for other metrics too in this implementation
-            _ => self.compute_distances(points, centroids),
-        }
+        (points_squared + centroids_squared - cross_term.mul_scalar(2.0))
+            .clamp_min(0.0)
+            .sqrt()
     }
 }
 
@@ -182,7 +177,7 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
 
         // Run K-means multiple times with different initializations
         for _init_run in 0..self.config.n_init {
-            if let Ok((centroids, labels, inertia, n_iter)) = self.single_run(x) {
+            if let Ok((centroids, labels, inertia, n_iter)) = self.single_run(x, _init_run) {
                 if inertia < best_inertia {
                     best_inertia = inertia;
                     best_centroids = Some(centroids);
@@ -205,11 +200,12 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
     fn single_run(
         &self,
         x: &Tensor<B, 2>,
+        run: usize,
     ) -> Result<(Tensor<B, 2>, Tensor<B, 1>, f32, usize), String> {
         let n_samples = x.dims()[0];
 
         // Initialize centroids
-        let mut centroids = self.initialize_centroids(x)?;
+        let mut centroids = self.initialize_centroids(x, run)?;
 
         let mut labels = Tensor::zeros([n_samples], &self.device);
 
@@ -218,7 +214,7 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
 
             // Assign points to closest centroids
             let distances = self.config.distance_metric.compute_distances(x, &centroids);
-            labels = distances.argmin(1).squeeze::<1>().float();
+            labels = distances.argmin(1).reshape([n_samples]).float();
 
             // Update centroids
             centroids = self.update_centroids(x, &labels)?;
@@ -235,38 +231,94 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
         Ok((centroids, labels, inertia, self.config.max_iterations))
     }
 
+    /// Deterministic RNG for one initialization run.
+    ///
+    /// The run index is folded into the seed so the `n_init` restarts differ
+    /// from each other while the fit as a whole stays reproducible.
+    fn rng(&self, run: usize) -> rand::rngs::StdRng {
+        match self.config.random_seed {
+            Some(seed) => rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(run as u64)),
+            None => rand::rngs::StdRng::from_entropy(),
+        }
+    }
+
     /// Initialize centroids based on the configured method
-    fn initialize_centroids(&self, x: &Tensor<B, 2>) -> Result<Tensor<B, 2>, String> {
+    fn initialize_centroids(&self, x: &Tensor<B, 2>, run: usize) -> Result<Tensor<B, 2>, String> {
+        let n_samples = x.dims()[0];
         let n_features = x.dims()[1];
+        let k = self.config.n_clusters;
+
+        let gather = |indices: &[usize], data: &[f32]| {
+            let mut out = Vec::with_capacity(indices.len() * n_features);
+            for &i in indices {
+                out.extend_from_slice(&data[i * n_features..(i + 1) * n_features]);
+            }
+            Tensor::from_data(
+                TensorData::new(out, [indices.len(), n_features]),
+                &self.device,
+            )
+        };
 
         match &self.config.init_method {
             InitMethod::Random => {
-                // Random initialization from data points
-                let data = x.to_data().convert::<f32>();
-                let data_vec: Vec<f32> = data
+                let data: Vec<f32> = x
+                    .to_data()
+                    .convert::<f32>()
                     .to_vec()
                     .map_err(|_| "Failed to convert tensor data to vector")?;
-                let mut centroids_data = Vec::new();
+                let mut rng = self.rng(run);
+                let indices: Vec<usize> = (0..k).map(|_| rng.gen_range(0..n_samples)).collect();
+                Ok(gather(&indices, &data))
+            }
 
-                for _k in 0..self.config.n_clusters {
-                    let random_idx =
-                        (rand::random::<f32>() * x.dims()[0] as f32) as usize % x.dims()[0];
-                    for j in 0..n_features {
-                        centroids_data.push(data_vec[random_idx * n_features + j]);
+            InitMethod::KMeansPlusPlus => {
+                // D^2 seeding: after a uniformly random first centroid, each
+                // next one is sampled with probability proportional to its
+                // squared distance from the nearest centroid chosen so far.
+                let data: Vec<f32> = x
+                    .to_data()
+                    .convert::<f32>()
+                    .to_vec()
+                    .map_err(|_| "Failed to convert tensor data to vector")?;
+                let mut rng = self.rng(run);
+                let mut chosen = vec![rng.gen_range(0..n_samples)];
+                let mut nearest = vec![f32::INFINITY; n_samples];
+
+                while chosen.len() < k {
+                    let last = *chosen.last().unwrap();
+                    for i in 0..n_samples {
+                        let mut squared = 0.0;
+                        for j in 0..n_features {
+                            let diff = data[i * n_features + j] - data[last * n_features + j];
+                            squared += diff * diff;
+                        }
+                        nearest[i] = nearest[i].min(squared);
                     }
+
+                    let total: f32 = nearest.iter().sum();
+                    let pick = if total <= f32::EPSILON {
+                        // Every point already coincides with a chosen centroid.
+                        rng.gen_range(0..n_samples)
+                    } else {
+                        let mut target = rng.gen_range(0.0..total);
+                        let mut candidate = n_samples - 1;
+                        for (i, &weight) in nearest.iter().enumerate() {
+                            target -= weight;
+                            if target <= 0.0 {
+                                candidate = i;
+                                break;
+                            }
+                        }
+                        candidate
+                    };
+                    chosen.push(pick);
                 }
 
-                let centroids_tensor_data =
-                    TensorData::new(centroids_data, [self.config.n_clusters, n_features]);
-                Ok(Tensor::from_data(centroids_tensor_data, &self.device))
+                Ok(gather(&chosen, &data))
             }
-            InitMethod::KMeansPlusPlus => {
-                // For simplicity, fall back to random initialization
-                let random_config = InitMethod::Random;
-                self.initialize_centroids_from_method(x, &random_config)
-            }
+
             InitMethod::Manual(manual_centroids) => {
-                if manual_centroids.len() != self.config.n_clusters {
+                if manual_centroids.len() != k {
                     return Err("Number of manual centroids must match n_clusters".to_string());
                 }
                 if manual_centroids
@@ -279,42 +331,11 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
                 }
 
                 let flat_data: Vec<f32> = manual_centroids.iter().flatten().copied().collect();
-                let centroids_tensor_data =
-                    TensorData::new(flat_data, [self.config.n_clusters, n_features]);
-                Ok(Tensor::from_data(centroids_tensor_data, &self.device))
+                Ok(Tensor::from_data(
+                    TensorData::new(flat_data, [k, n_features]),
+                    &self.device,
+                ))
             }
-        }
-    }
-
-    /// Helper for initialization
-    fn initialize_centroids_from_method(
-        &self,
-        x: &Tensor<B, 2>,
-        method: &InitMethod,
-    ) -> Result<Tensor<B, 2>, String> {
-        let n_features = x.dims()[1];
-
-        match method {
-            InitMethod::Random => {
-                let data = x.to_data().convert::<f32>();
-                let data_vec: Vec<f32> = data
-                    .to_vec()
-                    .map_err(|_| "Failed to convert tensor data to vector")?;
-                let mut centroids_data = Vec::new();
-
-                for _k in 0..self.config.n_clusters {
-                    let random_idx =
-                        (rand::random::<f32>() * x.dims()[0] as f32) as usize % x.dims()[0];
-                    for j in 0..n_features {
-                        centroids_data.push(data_vec[random_idx * n_features + j]);
-                    }
-                }
-
-                let centroids_tensor_data =
-                    TensorData::new(centroids_data, [self.config.n_clusters, n_features]);
-                Ok(Tensor::from_data(centroids_tensor_data, &self.device))
-            }
-            _ => Err("Unsupported initialization method".to_string()),
         }
     }
 
@@ -424,7 +445,7 @@ impl<B: Backend<FloatElem = f32>> KMeans<B> {
 
         let centroids = self.centroids.as_ref().unwrap();
         let distances = self.config.distance_metric.compute_distances(x, centroids);
-        Ok(distances.argmin(1).squeeze::<1>().float())
+        Ok(distances.argmin(1).reshape([x.dims()[0]]).float())
     }
 
     /// Fit the model and predict cluster assignments

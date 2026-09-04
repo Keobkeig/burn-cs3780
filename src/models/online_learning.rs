@@ -14,8 +14,18 @@ pub trait OnlineLearner<B: Backend<FloatElem = f32>> {
     /// Update the model with a single example
     fn partial_fit(&mut self, x: &Tensor<B, 1>, y: f32) -> Result<(), String>;
 
-    /// Predict a single example
+    /// Predict a single example, as -1 or +1 to match the training labels
     fn predict_one(&self, x: &Tensor<B, 1>) -> Result<f32, String>;
+
+    /// Raw decision score `w . x + b` for a single example.
+    ///
+    /// Its sign is the prediction; its magnitude is the margin. Counting
+    /// mistakes needs this rather than the thresholded class, so that a
+    /// correct negative prediction is not mistaken for a zero score.
+    fn decision_score(&self, x: &Tensor<B, 1>) -> Result<f32, String>;
+
+    /// Current bias term, or 0 if this learner does not fit an intercept.
+    fn bias(&self) -> f32;
 
     /// Predict multiple examples
     fn predict(&self, x: &Tensor<B, 2>) -> Result<Tensor<B, 1>, String> {
@@ -185,7 +195,15 @@ impl<B: Backend<FloatElem = f32>> OnlineLearner<B> for OnlinePerceptron<B> {
 
     fn predict_one(&self, x: &Tensor<B, 1>) -> Result<f32, String> {
         let decision = self.decision_function_one(x)?;
-        Ok(if decision > 0.0 { 1.0 } else { 0.0 })
+        Ok(if decision > 0.0 { 1.0 } else { -1.0 })
+    }
+
+    fn decision_score(&self, x: &Tensor<B, 1>) -> Result<f32, String> {
+        self.decision_function_one(x)
+    }
+
+    fn bias(&self) -> f32 {
+        self.bias
     }
 
     fn is_initialized(&self) -> bool {
@@ -394,7 +412,15 @@ impl<B: Backend<FloatElem = f32>> OnlineLearner<B> for PassiveAggressive<B> {
 
     fn predict_one(&self, x: &Tensor<B, 1>) -> Result<f32, String> {
         let decision = self.decision_function_one(x)?;
-        Ok(if decision > 0.0 { 1.0 } else { 0.0 })
+        Ok(if decision > 0.0 { 1.0 } else { -1.0 })
+    }
+
+    fn decision_score(&self, x: &Tensor<B, 1>) -> Result<f32, String> {
+        self.decision_function_one(x)
+    }
+
+    fn bias(&self) -> f32 {
+        self.bias
     }
 
     fn is_initialized(&self) -> bool {
@@ -661,15 +687,23 @@ impl<B: Backend<FloatElem = f32>> OnlineLearner<B> for OnlineSGD<B> {
 
         // Return prediction based on loss function
         match self.config.loss.as_str() {
-            "hinge" => Ok(if decision > 0.0 { 1.0 } else { 0.0 }),
+            "hinge" => Ok(if decision > 0.0 { 1.0 } else { -1.0 }),
             "log" => {
                 // Logistic prediction
                 let prob = 1.0 / (1.0 + (-decision).exp());
-                Ok(if prob > 0.5 { 1.0 } else { 0.0 })
+                Ok(if prob > 0.5 { 1.0 } else { -1.0 })
             }
             "squared_loss" | "huber" => Ok(decision), // Regression: return raw prediction
-            _ => Ok(if decision > 0.0 { 1.0 } else { 0.0 }),
+            _ => Ok(if decision > 0.0 { 1.0 } else { -1.0 }),
         }
+    }
+
+    fn decision_score(&self, x: &Tensor<B, 1>) -> Result<f32, String> {
+        self.decision_function_one(x)
+    }
+
+    fn bias(&self) -> f32 {
+        self.bias
     }
 
     fn is_initialized(&self) -> bool {
@@ -735,7 +769,7 @@ mod tests {
     fn test_online_perceptron_partial_fit() {
         let device = &burn::tensor::Device::<DefaultBackend>::default();
         let config = OnlinePerceptronConfig::default();
-        let mut perceptron = OnlinePerceptron::new(config);
+        let mut perceptron = OnlinePerceptron::<DefaultBackend>::new(config);
 
         // Single training example
         let x = Tensor::from_data(TensorData::new(vec![1.0, 2.0], [2]), device);
@@ -751,7 +785,7 @@ mod tests {
     fn test_online_perceptron_predict() {
         let device = &burn::tensor::Device::<DefaultBackend>::default();
         let config = OnlinePerceptronConfig::default();
-        let mut perceptron = OnlinePerceptron::new(config);
+        let mut perceptron = OnlinePerceptron::<DefaultBackend>::new(config);
 
         // Train with a few examples
         let x1 = Tensor::from_data(TensorData::new(vec![1.0, 1.0], [2]), device);
@@ -769,7 +803,7 @@ mod tests {
     fn test_passive_aggressive_partial_fit() {
         let device = &burn::tensor::Device::<DefaultBackend>::default();
         let config = PassiveAggressiveConfig::default();
-        let mut pa = PassiveAggressive::new(config);
+        let mut pa = PassiveAggressive::<DefaultBackend>::new(config);
 
         let x = Tensor::from_data(TensorData::new(vec![1.0, 2.0], [2]), device);
         let y = 1.0;
@@ -783,7 +817,7 @@ mod tests {
     fn test_online_sgd_partial_fit() {
         let device = &burn::tensor::Device::<DefaultBackend>::default();
         let config = OnlineSGDConfig::default();
-        let mut sgd = OnlineSGD::new(config);
+        let mut sgd = OnlineSGD::<DefaultBackend>::new(config);
 
         let x = Tensor::from_data(TensorData::new(vec![1.0, 2.0], [2]), device);
         let y = 1.0;
@@ -800,7 +834,7 @@ mod tests {
             learning_rate_schedule: "invscaling".to_string(),
             ..Default::default()
         };
-        let mut sgd = OnlineSGD::new(config);
+        let mut sgd = OnlineSGD::<DefaultBackend>::new(config);
 
         let x = Tensor::from_data(TensorData::new(vec![1.0, 2.0], [2]), device);
         let initial_lr = sgd.current_learning_rate();

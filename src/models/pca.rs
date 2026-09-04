@@ -124,21 +124,42 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
             );
         }
 
-        // Center the data
-        let _mean = if self.center {
-            let mean = x.clone().mean_dim(0);
-            self.mean = Some(mean.clone().squeeze::<1>());
-            mean.squeeze::<1>()
+        // Center the data. PCA is a statement about the covariance of the
+        // centered data, so this has to happen before the decomposition.
+        let mean = if self.center {
+            x.clone().mean_dim(0).reshape([n_features])
         } else {
-            self.mean = Some(Tensor::zeros([n_features], &x.device()));
             Tensor::zeros([n_features], &x.device())
         };
+        self.mean = Some(mean.clone());
+
+        let centered = if self.center {
+            x.clone() - mean.unsqueeze_dim(0).repeat_dim(0, n_samples)
+        } else {
+            x.clone()
+        };
+
+        let processed = if self.scale {
+            let variance = centered
+                .clone()
+                .powf_scalar(2.0)
+                .sum_dim(0)
+                .reshape([n_features])
+                / ((n_samples - 1) as f32);
+            let std = variance.sqrt().clamp_min(1e-8);
+            self.std = Some(std.clone());
+            centered / std.unsqueeze_dim(0).repeat_dim(0, n_samples)
+        } else {
+            self.std = None;
+            centered
+        };
+
+        self.compute_svd_decomposition(&processed, n_components)?;
 
         self.is_fitted = true;
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn compute_svd_decomposition(
         &mut self,
         x: &Tensor<B, 2>,
@@ -155,17 +176,11 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         let gram_matrix = if n_samples >= n_features {
             // X^T * X / (n_samples - 1)
             let xt_x = x.clone().transpose().matmul(x.clone());
-            xt_x / Tensor::from_data(
-                TensorData::new(vec![(n_samples - 1) as f32], []),
-                &x.device(),
-            )
+            xt_x.div_scalar((n_samples - 1) as f32)
         } else {
             // X * X^T / (n_samples - 1)
             let x_xt = x.clone().matmul(x.clone().transpose());
-            x_xt / Tensor::from_data(
-                TensorData::new(vec![(n_samples - 1) as f32], []),
-                &x.device(),
-            )
+            x_xt.div_scalar((n_samples - 1) as f32)
         };
 
         // For this implementation, we'll use power iteration method to find top eigenvectors
@@ -186,8 +201,7 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
 
         // Compute explained variance ratio
         let explained_var_ratio = if total_var > 0.0 {
-            explained_var.clone()
-                / Tensor::from_data(TensorData::new(vec![total_var], []), &x.device())
+            explained_var.clone().div_scalar(total_var)
         } else {
             Tensor::zeros([n_components], &x.device())
         };
@@ -205,7 +219,6 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn power_iteration_pca(
         &self,
         gram_matrix: &Tensor<B, 2>,
@@ -232,19 +245,28 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
                 let v_new = remaining_matrix
                     .clone()
                     .matmul(v.clone().unsqueeze_dim(1))
-                    .squeeze::<1>();
+                    .reshape([n_features]);
                 let norm = v_new.clone().powf_scalar(2.0).sum().sqrt();
                 v = v_new / norm;
             }
 
             components.push(v.clone());
 
-            // Deflate the matrix (remove the found component)
+            // Deflate by lambda * v v^T, where lambda = v^T A v is the
+            // eigenvalue just found. Subtracting a bare v v^T barely dents a
+            // matrix whose eigenvalues are large, so the next iteration would
+            // converge right back to the same direction.
+            let lambda = v
+                .clone()
+                .unsqueeze_dim::<2>(0)
+                .matmul(remaining_matrix.clone())
+                .matmul(v.clone().unsqueeze_dim(1))
+                .into_scalar();
             let v_outer = v
                 .clone()
                 .unsqueeze_dim(1)
                 .matmul(v.clone().unsqueeze_dim(0));
-            remaining_matrix = remaining_matrix - v_outer;
+            remaining_matrix = remaining_matrix - v_outer.mul_scalar(lambda);
         }
 
         // Stack components into matrix
@@ -268,7 +290,6 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         Ok(components_tensor)
     }
 
-    #[allow(dead_code)]
     fn compute_explained_variance(
         &self,
         x: &Tensor<B, 2>,
@@ -280,16 +301,17 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         let projected = x.clone().matmul(components.clone());
 
         // Compute variance of each projection manually since var_dim doesn't exist in Burn 0.20
+        // mean_dim keeps the reduced axis, so mean_proj is already [1, k] and
+        // broadcasts against the projection directly.
         let mean_proj = projected.clone().mean_dim(0);
-        let centered = projected - mean_proj.unsqueeze_dim(0).repeat_dim(0, n_samples);
+        let centered = projected - mean_proj;
         let squared_centered = centered.powf_scalar(2.0);
-        let variance = squared_centered.sum_dim(0)
-            / Tensor::from_data(
-                TensorData::new(vec![(n_samples - 1) as f32], []),
-                &x.device(),
-            );
+        let variance = squared_centered
+            .sum_dim(0)
+            .div_scalar((n_samples - 1) as f32);
 
-        Ok(variance.squeeze::<1>())
+        let n_components = components.dims()[1];
+        Ok(variance.reshape([n_components]))
     }
 
     #[allow(dead_code)]
@@ -331,7 +353,8 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
 
         let components = self.components.as_ref().unwrap();
         let mean = self.mean.as_ref().unwrap();
-        let std = self.std.as_ref().unwrap();
+        // `std` is only populated when scaling was requested.
+        let std = self.std.as_ref();
 
         let n_samples = x.dims()[0];
 
@@ -343,7 +366,7 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         };
 
         // Scale the data if needed
-        let x_processed = if self.scale {
+        let x_processed = if let (true, Some(std)) = (self.scale, std) {
             x_centered / std.clone().unsqueeze_dim(0).repeat_dim(0, n_samples)
         } else {
             x_centered
@@ -379,7 +402,8 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
 
         let components = self.components.as_ref().unwrap();
         let mean = self.mean.as_ref().unwrap();
-        let std = self.std.as_ref().unwrap();
+        // `std` is only populated when scaling was requested.
+        let std = self.std.as_ref();
 
         let n_samples = x_transformed.dims()[0];
 
@@ -387,7 +411,7 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
         let x_reconstructed = x_transformed.clone().matmul(components.clone().transpose());
 
         // Unscale if scaling was applied
-        let x_unscaled = if self.scale {
+        let x_unscaled = if let (true, Some(std)) = (self.scale, std) {
             x_reconstructed * std.clone().unsqueeze_dim(0).repeat_dim(0, n_samples)
         } else {
             x_reconstructed
@@ -503,10 +527,10 @@ mod tests {
     #[test]
     fn test_pca_simple_fit() {
         // Simple 2D data
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(
-            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0],
-            [4, 2],
-        ));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], [4, 2]),
+            &Default::default(),
+        );
 
         let mut pca = PCA::new(Some(2), true, false);
         let result = pca.fit(&data);
@@ -519,10 +543,10 @@ mod tests {
     #[test]
     fn test_pca_transform() {
         // Simple 2D data
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(
-            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0],
-            [4, 2],
-        ));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], [4, 2]),
+            &Default::default(),
+        );
 
         let mut pca = PCA::new(Some(2), true, false);
         let _ = pca.fit(&data);
@@ -536,10 +560,10 @@ mod tests {
 
     #[test]
     fn test_pca_fit_transform() {
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            [3, 2],
-        ));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]),
+            &Default::default(),
+        );
 
         let mut pca = PCA::new(Some(1), true, false);
         let result = pca.fit_transform(&data);
@@ -551,7 +575,10 @@ mod tests {
 
     #[test]
     fn test_pca_insufficient_samples() {
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(vec![1.0, 2.0], [1, 2]));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 2.0], [1, 2]),
+            &Default::default(),
+        );
 
         let mut pca = PCA::new(Some(1), true, false);
         let result = pca.fit(&data);
@@ -560,10 +587,10 @@ mod tests {
 
     #[test]
     fn test_pca_too_many_components() {
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(
-            vec![1.0, 2.0, 3.0, 4.0],
-            [2, 2],
-        ));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0], [2, 2]),
+            &Default::default(),
+        );
 
         let mut pca = PCA::new(Some(5), true, false);
         let result = pca.fit(&data);
@@ -572,10 +599,10 @@ mod tests {
 
     #[test]
     fn test_pca_transform_before_fit() {
-        let data = Tensor::<DefaultBackend, 2>::from_data(TensorData::new(
-            vec![1.0, 2.0, 3.0, 4.0],
-            [2, 2],
-        ));
+        let data = Tensor::<DefaultBackend, 2>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0], [2, 2]),
+            &Default::default(),
+        );
 
         let pca = PCA::<DefaultBackend>::new(Some(1), true, false);
         let result = pca.transform(&data);

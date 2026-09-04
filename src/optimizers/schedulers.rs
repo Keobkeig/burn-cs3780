@@ -31,8 +31,10 @@ impl StepLR {
 
 impl LRScheduler for StepLR {
     fn step(&mut self) -> f32 {
-        self.current_step += 1;
+        // Compute for the current step, then advance — the first call must
+        // return the initial rate, as it does in every other framework.
         let decay_factor = self.gamma.powi((self.current_step / self.step_size) as i32);
+        self.current_step += 1;
         self.initial_lr * decay_factor
     }
 
@@ -62,8 +64,9 @@ impl ExponentialLR {
 
 impl LRScheduler for ExponentialLR {
     fn step(&mut self) -> f32 {
+        let lr = self.initial_lr * self.gamma.powi(self.current_step as i32);
         self.current_step += 1;
-        self.initial_lr * self.gamma.powi(self.current_step as i32)
+        lr
     }
 
     fn reset(&mut self) {

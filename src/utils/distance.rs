@@ -1,6 +1,6 @@
 //! Distance metrics for comparing vectors and computing pairwise distances
 
-use burn::tensor::{backend::Backend, Tensor, TensorData};
+use burn::tensor::{backend::Backend, Tensor};
 
 /// Distance metrics
 pub struct Distance;
@@ -34,26 +34,51 @@ impl Distance {
         }
     }
 
-    /// Pairwise Euclidean distances between two sets of points
+    /// Squared-norm rows of `x`, shaped `[n, 1]`.
+    fn squared_norms<B: Backend<FloatElem = f32>>(x: &Tensor<B, 2>) -> Tensor<B, 2> {
+        x.clone().powf_scalar(2.0).sum_dim(1)
+    }
+
+    /// Pairwise Euclidean distances between two sets of points, `[n1, n2]`.
+    ///
+    /// Expanded as `||a||^2 + ||b||^2 - 2 a.b` so the whole matrix is three
+    /// tensor ops. Evaluating a model over a mesh means tens of thousands of
+    /// rows, and a per-pair loop spends all its time allocating.
     pub fn pairwise_euclidean<B: Backend<FloatElem = f32>>(
         x1: &Tensor<B, 2>,
         x2: &Tensor<B, 2>,
     ) -> Tensor<B, 2> {
-        let n1 = x1.dims()[0];
-        let n2 = x2.dims()[0];
-        let device = x1.device();
+        let cross = x1.clone().matmul(x2.clone().transpose());
+        let squared =
+            Self::squared_norms(x1) + Self::squared_norms(x2).transpose() - cross.mul_scalar(2.0);
+        // Cancellation can push exact zeros slightly negative.
+        squared.clamp_min(0.0).sqrt()
+    }
 
-        let mut distances = Vec::with_capacity(n1 * n2);
+    /// Pairwise Manhattan distances, `[n1, n2]`.
+    ///
+    /// No dot-product identity here, so this broadcasts to `[n1, n2, d]` and
+    /// reduces. Fine for the low-dimensional data these models see.
+    pub fn pairwise_manhattan<B: Backend<FloatElem = f32>>(
+        x1: &Tensor<B, 2>,
+        x2: &Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let [n1, _] = x1.dims();
+        let [n2, _] = x2.dims();
+        let a = x1.clone().unsqueeze_dim::<3>(1);
+        let b = x2.clone().unsqueeze_dim::<3>(0);
+        (a - b).abs().sum_dim(2).reshape([n1, n2])
+    }
 
-        for i in 0..n1 {
-            let row_i = x1.clone().slice([i..i + 1]).squeeze::<1>();
-            for j in 0..n2 {
-                let row_j = x2.clone().slice([j..j + 1]).squeeze::<1>();
-                let dist = Self::euclidean(&row_i, &row_j);
-                distances.push(dist);
-            }
-        }
-
-        Tensor::from_data(TensorData::new(distances, [n1, n2]), &device)
+    /// Pairwise cosine distances (`1 - similarity`), `[n1, n2]`.
+    pub fn pairwise_cosine<B: Backend<FloatElem = f32>>(
+        x1: &Tensor<B, 2>,
+        x2: &Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let cross = x1.clone().matmul(x2.clone().transpose());
+        // Floor the norms so a zero vector gives similarity 0 rather than NaN.
+        let n1 = Self::squared_norms(x1).sqrt().clamp_min(1e-12);
+        let n2 = Self::squared_norms(x2).sqrt().clamp_min(1e-12).transpose();
+        cross.div(n1 * n2).neg().add_scalar(1.0)
     }
 }

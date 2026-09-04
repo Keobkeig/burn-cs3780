@@ -167,10 +167,13 @@ pub fn make_xor_dataset<B: Backend>(
         }
     }
 
-    // Convert to tensors for XOR
-    let features = Tensor::from_data(TensorData::new(features_data, [n_samples, 2]), device);
+    // Convert to tensors for XOR. The quadrants split n_samples evenly, so
+    // the real count is the truncated one — using n_samples here made any
+    // request that was not a multiple of four panic on the shape.
+    let actual_samples = samples_per_quadrant * 4;
+    let features = Tensor::from_data(TensorData::new(features_data, [actual_samples, 2]), device);
 
-    let labels = Tensor::from_data(TensorData::new(labels_data, [n_samples, 1]), device);
+    let labels = Tensor::from_data(TensorData::new(labels_data, [actual_samples, 1]), device);
 
     Dataset::new(
         features,
@@ -279,5 +282,102 @@ pub fn make_blobs<B: Backend>(
         labels,
         vec!["x1".to_string(), "x2".to_string()],
         class_names,
+    )
+}
+
+/// Generate grayscale images of four shapes: disc, square, ring, triangle.
+///
+/// Each image is `size x size` with the shape at a random centre, radius and
+/// (for the square and triangle) rotation, so a classifier cannot win by
+/// memorizing positions — it has to learn something about form. Returned as
+/// flat pixel rows in `[0, 1]`, shaped `[n_per_class * 4, size * size]`, with
+/// the class index as the label.
+///
+/// # Arguments
+/// * `n_per_class` - Images generated for each of the four shapes
+/// * `size` - Side length in pixels
+/// * `device` - Device to allocate the tensors on
+/// * `seed` - Fixed seed for reproducibility
+pub fn make_shape_images<B: Backend>(
+    n_per_class: usize,
+    size: usize,
+    device: &B::Device,
+    seed: Option<u64>,
+) -> Dataset<B> {
+    let mut rng = match seed {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    };
+
+    let mut features_data = Vec::with_capacity(n_per_class * 4 * size * size);
+    let mut labels_data = Vec::with_capacity(n_per_class * 4);
+
+    for class in 0..4 {
+        for _ in 0..n_per_class {
+            // In [-1, 1] coordinates, so a radius of 0.6 fills most of a
+            // 16-pixel image. Smaller than this and the ring's hole closes up.
+            let radius: f32 = rng.gen_range(0.5..0.75);
+            let jitter = (1.0 - radius) * 0.9;
+            let cx: f32 = rng.gen_range(-jitter..jitter);
+            let cy: f32 = rng.gen_range(-jitter..jitter);
+            let angle: f32 = rng.gen_range(0.0..std::f32::consts::TAU);
+            let (sin, cos) = angle.sin_cos();
+
+            for row in 0..size {
+                for col in 0..size {
+                    // Pixel centre in [-1, 1].
+                    let px = ((col as f32 + 0.5) / size as f32) * 2.0 - 1.0 - cx;
+                    let py = ((row as f32 + 0.5) / size as f32) * 2.0 - 1.0 - cy;
+                    // Rotate into the shape's frame.
+                    let x = px * cos + py * sin;
+                    let y = -px * sin + py * cos;
+
+                    // Signed distance: positive inside.
+                    let inside = match class {
+                        0 => radius - (x * x + y * y).sqrt(),
+                        1 => radius - x.abs().max(y.abs()),
+                        2 => {
+                            // Ring: inside the outer edge and outside the hole.
+                            let r = (x * x + y * y).sqrt();
+                            (radius - r).min(r - radius * 0.55)
+                        }
+                        _ => {
+                            // Triangle: below the base line, and inside both
+                            // slanted sides. The half-width tapers linearly
+                            // from `radius` at the base to zero at the apex.
+                            (radius - y).min((y + radius) * 0.5 - x.abs())
+                        }
+                    };
+
+                    // Soft edges: a pixel's value is how far inside the
+                    // shape it is, scaled so the transition is about one
+                    // pixel wide. Hard edges alias badly enough at these
+                    // sizes to read as noise.
+                    let value = (inside * size as f32 * 0.5).clamp(0.0, 1.0);
+                    features_data.push(value);
+                }
+            }
+
+            labels_data.push(class as f32);
+        }
+    }
+
+    let n_samples = n_per_class * 4;
+    let features = Tensor::from_data(
+        TensorData::new(features_data, [n_samples, size * size]),
+        device,
+    );
+    let labels = Tensor::from_data(TensorData::new(labels_data, [n_samples, 1]), device);
+
+    Dataset::new(
+        features,
+        labels,
+        (0..size * size).map(|i| format!("px{}", i)).collect(),
+        vec![
+            "Disc".to_string(),
+            "Square".to_string(),
+            "Ring".to_string(),
+            "Triangle".to_string(),
+        ],
     )
 }

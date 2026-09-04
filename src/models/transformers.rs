@@ -7,7 +7,10 @@
 //! - Full transformer models for sequence-to-sequence tasks
 
 use burn::module::Module;
-use burn::nn::{Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{
+    Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
+    LinearConfig,
+};
 use burn::tensor::Device;
 use burn::tensor::{activation::softmax, backend::Backend, Tensor};
 use std::fmt;
@@ -327,6 +330,17 @@ impl<B: Backend> TransformerEncoderLayer<B> {
     }
 }
 
+impl<B: Backend> TransformerEncoderLayer<B> {
+    /// Attention weights this layer would produce for `x`.
+    ///
+    /// Shape `[batch, heads, seq, seq]`; row `i` is how much position `i`
+    /// attends to every position.
+    pub fn attention_weights(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 4> {
+        self.attention
+            .get_attention_weights(x.clone(), x.clone(), x, mask)
+    }
+}
+
 /// Feed-forward network configuration
 #[derive(Debug, Clone)]
 pub struct FeedForwardConfig {
@@ -404,8 +418,8 @@ impl Default for TransformerEncoderConfig {
 /// Transformer encoder
 #[derive(Module, Debug)]
 pub struct TransformerEncoder<B: Backend> {
-    /// Token embedding
-    embedding: Linear<B>,
+    /// Token embedding table, `[vocab_size, d_model]`
+    embedding: Embedding<B>,
     /// Position encoding
     position_encoding: PositionEncoding<B>,
     /// Encoder layers
@@ -440,7 +454,17 @@ impl<B: Backend> TransformerEncoder<B> {
         }
 
         Self {
-            embedding: LinearConfig::new(config.vocab_size, config.d_model).init(device),
+            // Burn initializes embeddings at N(0, 1), but the forward pass
+            // rescales by sqrt(d_model) as in the paper — which assumes
+            // N(0, 1/d_model). Left at the default, attention scores land
+            // around +/-30 and softmax is saturated before training starts,
+            // so no gradient ever reaches the attention weights.
+            embedding: EmbeddingConfig::new(config.vocab_size, config.d_model)
+                .with_initializer(burn::module::Initializer::Normal {
+                    mean: 0.0,
+                    std: 1.0 / (config.d_model as f64).sqrt(),
+                })
+                .init(device),
             position_encoding: PositionEncoding::new(&pe_config, device),
             layers,
             norm: LayerNormConfig::new(config.d_model).init(device),
@@ -458,18 +482,11 @@ impl<B: Backend> TransformerEncoder<B> {
     /// # Returns
     /// * Output tensor of shape [batch_size, seq_len, d_model]
     pub fn forward(&self, input_ids: Tensor<B, 2>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 3> {
-        // Convert input IDs to one-hot encoding for embedding
-        let batch_size = input_ids.dims()[0];
-        let seq_len = input_ids.dims()[1];
-
-        // Simple embedding lookup (in practice, you'd use a proper embedding layer)
-        let input_ids_3d =
-            input_ids
-                .unsqueeze_dim::<3>(2)
-                .expand([batch_size, seq_len, self.d_model]);
-
-        // Token embedding
-        let mut x = self.embedding.forward(input_ids_3d);
+        // Token embedding. This used to broadcast the raw id across every
+        // channel and push it through a Linear, which made every token's
+        // vector a scalar multiple of every other token's — the model could
+        // only ever see ids as magnitudes, never as distinct symbols.
+        let mut x = self.embedding.forward(input_ids.int());
 
         // Scale by sqrt(d_model)
         x = x * (self.d_model as f32).sqrt();
@@ -487,6 +504,26 @@ impl<B: Backend> TransformerEncoder<B> {
 
         // Final layer normalization
         self.norm.forward(x)
+    }
+
+    /// Attention weights from every layer, in order.
+    ///
+    /// Each entry is `[batch, heads, seq, seq]`. The stack is re-run rather
+    /// than cached so `forward` stays allocation-free for training.
+    pub fn attention_weights(
+        &self,
+        input_ids: Tensor<B, 2>,
+        mask: Option<Tensor<B, 4>>,
+    ) -> Vec<Tensor<B, 4>> {
+        let mut x = self.embedding.forward(input_ids.int()) * (self.d_model as f32).sqrt();
+        x = self.dropout.forward(self.position_encoding.forward(x));
+
+        let mut weights = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            weights.push(layer.attention_weights(x.clone(), mask.clone()));
+            x = layer.forward(x, mask.clone());
+        }
+        weights
     }
 }
 
@@ -515,6 +552,11 @@ impl<B: Backend> TransformerClassifier<B> {
         }
     }
 
+    /// The underlying encoder, for attention visualization.
+    pub fn encoder(&self) -> &TransformerEncoder<B> {
+        &self.encoder
+    }
+
     /// Forward pass for classification
     ///
     /// # Arguments
@@ -528,12 +570,12 @@ impl<B: Backend> TransformerClassifier<B> {
         let encoder_output = self.encoder.forward(input_ids, mask);
 
         // Use [CLS] token representation (first token) for classification
-        let cls_output = encoder_output.clone().slice([
-            0..encoder_output.dims()[0],
-            0..1,
-            0..encoder_output.dims()[2],
-        ]);
-        let cls_output = cls_output.squeeze::<2>();
+        let [batch_size, _, d_model] = encoder_output.dims();
+        let cls_output = encoder_output
+            .slice([0..batch_size, 0..1, 0..d_model])
+            // reshape, not squeeze: a single-item batch would squeeze away
+            // the batch axis too and leave nothing.
+            .reshape([batch_size, d_model]);
 
         // Apply dropout and classification head
         let cls_output = self.dropout.forward(cls_output);
@@ -676,4 +718,390 @@ mod tests {
         let output = layer.forward(input, None);
         assert_eq!(output.dims(), [batch_size, seq_len, config.d_model]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Training
+// ---------------------------------------------------------------------------
+
+impl<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>> TransformerClassifier<B> {
+    /// Train the classifier on tokenized sequences.
+    ///
+    /// Mini-batch Adam over `[n_samples, seq_len]` token ids with integer
+    /// class labels. Returns the trained model and the mean loss per epoch.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token ids as floats, `[n_samples, seq_len]`
+    /// * `y` - Class indices as floats, `[n_samples]`
+    /// * `epochs` - Passes over the data
+    /// * `lr` - Adam learning rate
+    /// * `batch_size` - Sequences per gradient step
+    pub fn train_classifier(
+        mut self,
+        input_ids: Tensor<B, 2>,
+        y: Tensor<B, 1>,
+        epochs: usize,
+        lr: f64,
+        batch_size: usize,
+    ) -> (Self, Vec<f32>) {
+        use burn::nn::loss::CrossEntropyLossConfig;
+        use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+
+        let device = y.device();
+        let n_samples = input_ids.dims()[0];
+        let batch_size = batch_size.clamp(1, n_samples.max(1));
+        let targets = y.int();
+        let loss_fn = CrossEntropyLossConfig::new().init(&device);
+        let mut optimizer = AdamConfig::new().init();
+        let mut history = Vec::with_capacity(epochs);
+
+        for _ in 0..epochs {
+            let mut epoch_loss = 0.0;
+            let mut steps = 0;
+            let mut start = 0;
+
+            while start < n_samples {
+                let end = (start + batch_size).min(n_samples);
+                let batch = input_ids.clone().slice([start..end]);
+                let batch_targets = targets.clone().slice([start..end]);
+
+                let loss = loss_fn.forward(self.forward(batch, None), batch_targets);
+                epoch_loss += loss.clone().into_scalar();
+                steps += 1;
+
+                let grads = GradientsParams::from_grads(loss.backward(), &self);
+                self = optimizer.step(lr, self, grads);
+                start = end;
+            }
+
+            history.push(if steps > 0 {
+                epoch_loss / steps as f32
+            } else {
+                f32::NAN
+            });
+        }
+
+        (self, history)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Character tokenizer
+// ---------------------------------------------------------------------------
+
+/// A minimal character vocabulary for the text demos.
+///
+/// Id 0 is the classification token the classifier reads its answer from,
+/// id 1 is padding, and 2..28 are the letters a-z. Everything else is
+/// dropped, which suits the word lists in [`crate::models::naive_bayes`].
+pub struct CharTokenizer;
+
+impl CharTokenizer {
+    /// Reserved id for the leading `[CLS]` position.
+    pub const CLS: f32 = 0.0;
+    /// Reserved id for padding.
+    pub const PAD: f32 = 1.0;
+    /// Total vocabulary size: two reserved ids plus the alphabet.
+    pub const VOCAB: usize = 28;
+
+    /// Tokenize one word into `seq_len` ids, `[CLS]` first and padded after.
+    ///
+    /// Words longer than `seq_len - 1` are truncated.
+    pub fn encode(word: &str, seq_len: usize) -> Vec<f32> {
+        let mut ids = Vec::with_capacity(seq_len);
+        ids.push(Self::CLS);
+        for ch in word.to_lowercase().chars() {
+            if ids.len() >= seq_len {
+                break;
+            }
+            if ch.is_ascii_lowercase() {
+                ids.push((ch as u8 - b'a') as f32 + 2.0);
+            }
+        }
+        ids.resize(seq_len, Self::PAD);
+        ids
+    }
+
+    /// The characters that survived tokenization, aligned to `encode`'s
+    /// output so a page can label an attention matrix.
+    pub fn tokens(word: &str, seq_len: usize) -> Vec<String> {
+        let mut out = vec!["[CLS]".to_string()];
+        for ch in word.to_lowercase().chars() {
+            if out.len() >= seq_len {
+                break;
+            }
+            if ch.is_ascii_lowercase() {
+                out.push(ch.to_string());
+            }
+        }
+        while out.len() < seq_len {
+            out.push("·".to_string());
+        }
+        out
+    }
+
+    /// Tokenize a batch of words into a `[n_words, seq_len]` tensor.
+    pub fn encode_batch<B: Backend<FloatElem = f32>>(
+        words: &[String],
+        seq_len: usize,
+        device: &Device<B>,
+    ) -> Tensor<B, 2> {
+        let mut data = Vec::with_capacity(words.len() * seq_len);
+        for word in words {
+            data.extend(Self::encode(word, seq_len));
+        }
+        Tensor::from_data(
+            burn::tensor::TensorData::new(data, [words.len(), seq_len]),
+            device,
+        )
+    }
+}
+
+/// Generate strings for a letter-search task.
+///
+/// Half the strings contain `target` and half do not, at a random position
+/// and with random length. Unlike the word lists this produces as many
+/// examples as a model needs.
+///
+/// The task is deliberately one a single attention layer can solve: the only
+/// way the `[CLS]` position can know the answer is to attend to the position
+/// holding the target, so a trained head has to point at it. A bag-of-letters
+/// model would also solve the task — the point is to watch *where* the head
+/// looks, not to beat a baseline.
+///
+/// Returns the strings and their labels, 1.0 for "contains the target".
+pub fn make_letter_search_words(
+    n_samples: usize,
+    target: char,
+    seed: u64,
+) -> (Vec<String>, Vec<f32>) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    let alphabet: Vec<char> = "abcdefghlmnoprstu"
+        .chars()
+        .filter(|&c| c != target)
+        .collect();
+
+    let mut words = Vec::with_capacity(n_samples);
+    let mut labels = Vec::with_capacity(n_samples);
+
+    for i in 0..n_samples {
+        let contains = i % 2 == 0;
+        let length = rng.gen_range(4..=9);
+        let mut chars: Vec<char> = (0..length)
+            .map(|_| alphabet[rng.gen_range(0..alphabet.len())])
+            .collect();
+
+        if contains {
+            let at = rng.gen_range(0..chars.len());
+            chars[at] = target;
+        }
+
+        words.push(chars.into_iter().collect());
+        labels.push(if contains { 1.0 } else { 0.0 });
+    }
+
+    (words, labels)
+}
+
+// ---------------------------------------------------------------------------
+// Character-level language model
+// ---------------------------------------------------------------------------
+
+/// Causal attention mask, shaped `[1, 1, seq_len, seq_len]`.
+///
+/// `1.0` marks a position to hide and `0.0` one to keep, matching the
+/// `scores + mask * -1e9` convention in [`MultiHeadAttention`]. Broadcasts
+/// over batch and heads. Without it every position can see the whole
+/// sequence, and next-character prediction is trivially solved by reading
+/// the answer.
+pub fn causal_mask<B: Backend>(seq_len: usize, device: &Device<B>) -> Tensor<B, 4> {
+    let mut data = Vec::with_capacity(seq_len * seq_len);
+    for query in 0..seq_len {
+        for key in 0..seq_len {
+            data.push(if key > query { 1.0 } else { 0.0 });
+        }
+    }
+    Tensor::<B, 2>::from_data(
+        burn::tensor::TensorData::new(data, [seq_len, seq_len]),
+        device,
+    )
+    .reshape([1, 1, seq_len, seq_len])
+}
+
+/// A transformer that predicts the next character at every position.
+///
+/// Same encoder as the classifier, with two differences: attention is masked
+/// so a position can only see what came before it, and the head projects to
+/// the vocabulary at every position rather than to classes at one.
+#[derive(Module, Debug)]
+pub struct TransformerLanguageModel<B: Backend> {
+    encoder: TransformerEncoder<B>,
+    head: Linear<B>,
+    seq_len: usize,
+}
+
+impl<B: Backend> TransformerLanguageModel<B> {
+    /// Build an untrained model over `config.vocab_size` symbols.
+    pub fn new(config: &TransformerEncoderConfig, device: &Device<B>) -> Self {
+        Self {
+            encoder: TransformerEncoder::new(config, device),
+            head: LinearConfig::new(config.d_model, config.vocab_size).init(device),
+            seq_len: config.max_len,
+        }
+    }
+
+    /// Next-token logits at every position, `[batch, seq_len, vocab_size]`.
+    pub fn forward(&self, input_ids: Tensor<B, 2>) -> Tensor<B, 3> {
+        let mask = causal_mask::<B>(input_ids.dims()[1], &input_ids.device());
+        self.head
+            .forward(self.encoder.forward(input_ids, Some(mask)))
+    }
+
+    /// Sequence length the model was built for.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+}
+
+impl<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>> TransformerLanguageModel<B> {
+    /// Train to predict `targets` from `inputs`, both `[n_samples, seq_len]`.
+    ///
+    /// Loss is cross-entropy over every position at once — the causal mask is
+    /// what makes that legitimate, since position `i` cannot see its own
+    /// answer. Returns the trained model and the mean loss per epoch.
+    pub fn train_lm(
+        mut self,
+        inputs: Tensor<B, 2>,
+        targets: Tensor<B, 2>,
+        epochs: usize,
+        lr: f64,
+        batch_size: usize,
+    ) -> (Self, Vec<f32>) {
+        use burn::nn::loss::CrossEntropyLossConfig;
+        use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+
+        let device = inputs.device();
+        let [n_samples, seq_len] = inputs.dims();
+        let batch_size = batch_size.clamp(1, n_samples.max(1));
+        let vocab = self.head.weight.dims()[1];
+        let target_ids = targets.int();
+
+        let loss_fn = CrossEntropyLossConfig::new().init(&device);
+        let mut optimizer = AdamConfig::new().init();
+        let mut history = Vec::with_capacity(epochs);
+
+        for _ in 0..epochs {
+            let mut epoch_loss = 0.0;
+            let mut steps = 0;
+            let mut start = 0;
+
+            while start < n_samples {
+                let end = (start + batch_size).min(n_samples);
+                let rows = end - start;
+
+                let logits = self
+                    .forward(inputs.clone().slice([start..end]))
+                    .reshape([rows * seq_len, vocab]);
+                let flat_targets = target_ids
+                    .clone()
+                    .slice([start..end])
+                    .reshape([rows * seq_len]);
+
+                let loss = loss_fn.forward(logits, flat_targets);
+                epoch_loss += loss.clone().into_scalar();
+                steps += 1;
+
+                let grads = GradientsParams::from_grads(loss.backward(), &self);
+                self = optimizer.step(lr, self, grads);
+                start = end;
+            }
+
+            history.push(if steps > 0 {
+                epoch_loss / steps as f32
+            } else {
+                f32::NAN
+            });
+        }
+
+        (self, history)
+    }
+}
+
+impl CharTokenizer {
+    /// The next-character targets for `word`: the encoding shifted left, so
+    /// position `i` of the input is asked to produce position `i + 1`.
+    ///
+    /// The final real character is asked to produce [`Self::PAD`], which is
+    /// how the model learns where words end.
+    pub fn encode_target(word: &str, seq_len: usize) -> Vec<f32> {
+        let mut ids: Vec<f32> = Self::encode(word, seq_len).into_iter().skip(1).collect();
+        ids.push(Self::PAD);
+        ids
+    }
+}
+
+/// Generate words in a synthetic language with vowel harmony.
+///
+/// Syllables are onset + vowel + optional coda, and every vowel in a word is
+/// drawn from the same set — front (e, i) or back (a, o, u). That is a real
+/// phenomenon (Turkish, Finnish) and a deliberately awkward one to learn: the
+/// constraint holds across the whole word, so a model that only looks at the
+/// previous character or two cannot enforce it. Attention can.
+///
+/// Unlike the built-in word lists this can produce as many distinct words as
+/// a model needs, which is the difference between learning the rule and
+/// memorizing the list.
+pub fn make_harmony_words(n_words: usize, seed: u64) -> Vec<String> {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    const ONSETS: [char; 11] = ['b', 'd', 'g', 'k', 'l', 'm', 'n', 'p', 'r', 's', 't'];
+    const CODAS: [char; 4] = ['n', 's', 'r', 'l'];
+    const FRONT: [char; 2] = ['e', 'i'];
+    const BACK: [char; 3] = ['a', 'o', 'u'];
+
+    let mut words = Vec::with_capacity(n_words);
+    while words.len() < n_words {
+        let front = rng.gen_bool(0.5);
+        let syllables = rng.gen_range(2..=3);
+        let mut word = String::new();
+
+        for i in 0..syllables {
+            word.push(ONSETS[rng.gen_range(0..ONSETS.len())]);
+            word.push(if front {
+                FRONT[rng.gen_range(0..FRONT.len())]
+            } else {
+                BACK[rng.gen_range(0..BACK.len())]
+            });
+            // Codas only between syllables and at the end, never doubling up.
+            if rng.gen_bool(0.35) || i == syllables - 1 && rng.gen_bool(0.25) {
+                word.push(CODAS[rng.gen_range(0..CODAS.len())]);
+            }
+        }
+
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+
+    words
+}
+
+/// Whether every vowel in `word` comes from the same harmony set.
+///
+/// The rule [`make_harmony_words`] generates by, and the one a generated
+/// sample either respects or does not.
+pub fn obeys_vowel_harmony(word: &str) -> bool {
+    let mut front = false;
+    let mut back = false;
+    for ch in word.chars() {
+        match ch {
+            'e' | 'i' => front = true,
+            'a' | 'o' | 'u' => back = true,
+            _ => {}
+        }
+    }
+    !(front && back)
 }

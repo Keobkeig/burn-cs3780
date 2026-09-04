@@ -1,0 +1,4 @@
+# getrandom 0.3 (pulled in by burn -> rand 0.9) needs both the wasm_js feature
+# and this cfg flag before it will build for the browser.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

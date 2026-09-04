@@ -93,7 +93,7 @@ impl<B: Backend<FloatElem = f32>> Perceptron<B> {
             // Process each sample
             for &idx in &sample_indices {
                 let x_sample = x_processed.clone().slice([idx..idx + 1]).squeeze::<1>();
-                let y_sample: f32 = y.clone().slice([idx..idx + 1]).squeeze::<1>().into_scalar();
+                let y_sample: f32 = y.clone().slice([idx..idx + 1]).into_scalar();
                 let y_binary = if y_sample > 0.5 { 1.0 } else { -1.0 };
 
                 // Predict
@@ -143,9 +143,12 @@ impl<B: Backend<FloatElem = f32>> Perceptron<B> {
             x.clone()
         };
 
+        let n_samples = x_processed.dims()[0];
         x_processed
             .matmul(weights.clone().unsqueeze_dim(1))
-            .squeeze::<1>()
+            // reshape, not squeeze: a single row gives [1, 1], and squeeze
+            // removes every unit axis, leaving nothing.
+            .reshape([n_samples])
     }
 
     /// Predict classes (0 or 1)
@@ -178,7 +181,7 @@ impl<B: Backend<FloatElem = f32>> Perceptron<B> {
         if self.fit_intercept {
             self.weights
                 .as_ref()
-                .map(|w| w.clone().slice([0..1]).squeeze::<1>().into_scalar())
+                .map(|w| w.clone().slice([0..1]).into_scalar())
         } else {
             None
         }
@@ -226,7 +229,7 @@ impl<B: Backend<FloatElem = f32>> MultiClassPerceptron<B> {
         let mut class_set = std::collections::HashSet::new();
 
         for i in 0..n_samples {
-            let label: f32 = y.clone().slice([i..i + 1]).squeeze::<1>().into_scalar();
+            let label: f32 = y.clone().slice([i..i + 1]).into_scalar();
             class_set.insert(label as i32);
         }
 
@@ -242,7 +245,7 @@ impl<B: Backend<FloatElem = f32>> MultiClassPerceptron<B> {
             // Create binary labels (1 for current class, -1 for others)
             let mut binary_labels = Vec::with_capacity(n_samples);
             for i in 0..n_samples {
-                let label: f32 = y.clone().slice([i..i + 1]).squeeze::<1>().into_scalar();
+                let label: f32 = y.clone().slice([i..i + 1]).into_scalar();
                 binary_labels.push(if (label as i32) == class_label {
                     1.0
                 } else {
@@ -346,7 +349,7 @@ impl PerceptronDemo {
 
             for i in 0..n_samples {
                 let x_sample = x_with_bias.clone().slice([i..i + 1]).squeeze::<1>();
-                let y_sample: f32 = y.clone().slice([i..i + 1]).squeeze::<1>().into_scalar();
+                let y_sample: f32 = y.clone().slice([i..i + 1]).into_scalar();
                 let y_binary = if y_sample > 0.5 { 1.0 } else { -1.0 };
 
                 // Predict
@@ -365,9 +368,9 @@ impl PerceptronDemo {
             weight_history.push((weights.clone(), error_rate));
 
             if epoch < 10 || epoch % 10 == 0 || errors == 0 {
-                let w0: f32 = weights.clone().slice([0..1]).squeeze::<1>().into_scalar();
-                let w1: f32 = weights.clone().slice([1..2]).squeeze::<1>().into_scalar();
-                let w2: f32 = weights.clone().slice([2..3]).squeeze::<1>().into_scalar();
+                let w0: f32 = weights.clone().slice([0..1]).into_scalar();
+                let w1: f32 = weights.clone().slice([1..2]).into_scalar();
+                let w2: f32 = weights.clone().slice([2..3]).into_scalar();
                 println!(
                     "{}\t{}\t[{:.3}, {:.3}, {:.3}]",
                     epoch + 1,

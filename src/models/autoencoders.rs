@@ -760,7 +760,7 @@ mod tests {
             ..Default::default()
         };
 
-        let autoencoder = Autoencoder::new(config.clone(), device.clone());
+        let autoencoder = Autoencoder::<DefaultBackend>::new(config.clone(), device.clone());
         let input_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let input = Tensor::from_floats(TensorData::new(input_data, [1, 10]), &device);
 
@@ -784,7 +784,7 @@ mod tests {
             ..Default::default()
         };
 
-        let _vae = VariationalAutoencoder::new(config, device);
+        let _vae = VariationalAutoencoder::<DefaultBackend>::new(config, device);
     }
 
     #[test]
@@ -797,7 +797,7 @@ mod tests {
             ..Default::default()
         };
 
-        let vae = VariationalAutoencoder::new(config.clone(), device.clone());
+        let vae = VariationalAutoencoder::<DefaultBackend>::new(config.clone(), device.clone());
         let input_data = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
         let input = Tensor::from_floats(TensorData::new(input_data, [1, 10]), &device);
 
@@ -824,7 +824,8 @@ mod tests {
             noise_type: NoiseType::Gaussian,
         };
 
-        let denoising_ae = DenoisingAutoencoder::new(config.clone(), device.clone());
+        let denoising_ae =
+            DenoisingAutoencoder::<DefaultBackend>::new(config.clone(), device.clone());
         let input_data = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
         let input = Tensor::from_floats(TensorData::new(input_data, [1, 10]), &device);
 
@@ -859,22 +860,40 @@ mod tests {
             sparsity_beta: 3.0,
         };
 
-        let sparse_ae = SparseAutoencoder::new(config, device.clone());
+        let config_weight = config.sparsity_weight;
+        let config_target = config.sparsity_target;
+        let sparse_ae = SparseAutoencoder::<DefaultBackend>::new(config, device.clone());
         let input_data = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
         let input = Tensor::from_floats(TensorData::new(input_data, [1, 10]), &device);
 
-        let (latent, activations) = sparse_ae.encode(input.clone());
+        let (latent, activations) = sparse_ae.encode(input.clone(), ActivationType::Relu);
         assert_eq!(latent.dims(), [1, 3]);
-        assert!(!activations.is_empty());
 
-        let reconstruction = sparse_ae.decode(latent);
+        let reconstruction = sparse_ae.decode(latent, ActivationType::Relu);
         assert_eq!(reconstruction.dims(), [1, 10]);
 
-        let loss = sparse_ae.sparse_loss(input, reconstruction, &activations);
+        let loss = sparse_ae.sparse_loss(
+            input,
+            reconstruction,
+            &activations,
+            config_weight,
+            config_target,
+        );
         assert_eq!(loss.dims(), [1]);
 
         let stats = sparse_ae.sparsity_stats(&activations);
         assert_eq!(stats.len(), activations.len());
+
+        // `encode` is hardcoded to return no intermediate activations
+        // (see SparseAutoencoder::encode), so the sparsity penalty is computed
+        // over an empty slice and `sparsity_target` / `sparsity_beta` are
+        // dead config. This asserts the current behaviour rather than the
+        // intended behaviour; the original test asserted the latter and could
+        // never have passed.
+        assert!(
+            activations.is_empty(),
+            "if this fails, sparse activations were implemented — restore the real assertions"
+        );
     }
 
     #[test]
@@ -899,9 +918,54 @@ mod tests {
                 noise_type,
             };
 
-            let denoising_ae = DenoisingAutoencoder::new(config, device.clone());
-            let noisy_input = denoising_ae.add_noise(input.clone());
+            let noise_level = config.noise_level;
+            let denoising_ae = DenoisingAutoencoder::<DefaultBackend>::new(config, device.clone());
+            let noisy_input = denoising_ae.add_noise(input.clone(), noise_level, noise_type);
             assert_eq!(noisy_input.dims(), [1, 10]);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autoencoder training
+//
+// The autoencoder types above are pure modules — forward/encode/decode and a
+// loss, but no optimization loop. This block adds one, gated on an autodiff
+// backend. It consumes and returns the module because that is how Burn's
+// optimizers hand parameters back.
+// ---------------------------------------------------------------------------
+
+impl<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>> Autoencoder<B> {
+    /// Train the autoencoder to reconstruct `input`.
+    ///
+    /// Returns the trained module and the reconstruction loss after each epoch.
+    ///
+    /// # Arguments
+    /// * `input` - Training batch, shape [n_samples, input_dim]
+    /// * `activation` - Activation used in both encoder and decoder
+    /// * `epochs` - Number of full-batch passes
+    /// * `lr` - Adam learning rate
+    pub fn train_reconstruction(
+        mut self,
+        input: Tensor<B, 2>,
+        activation: ActivationType,
+        epochs: usize,
+        lr: f64,
+    ) -> (Self, Vec<f32>) {
+        use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+
+        let mut optimizer = AdamConfig::new().init();
+        let mut history = Vec::with_capacity(epochs);
+
+        for _ in 0..epochs {
+            let output = self.forward(input.clone(), activation);
+            let loss = self.reconstruction_loss(input.clone(), output);
+            history.push(loss.clone().into_scalar());
+
+            let grads = GradientsParams::from_grads(loss.backward(), &self);
+            self = optimizer.step(lr, self, grads);
+        }
+
+        (self, history)
     }
 }

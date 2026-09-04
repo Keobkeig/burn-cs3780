@@ -24,6 +24,13 @@ impl RbfKernel {
 }
 
 impl<B: Backend<FloatElem = f32>> Kernel<B> for RbfKernel {
+    /// Whole Gram matrix at once: `exp(-gamma * ||a - b||^2)` expanded
+    /// through the dot-product identity, rather than a pair at a time.
+    fn kernel_matrix(&self, x1: &Tensor<B, 2>, x2: &Tensor<B, 2>) -> Tensor<B, 2> {
+        let squared = crate::utils::Distance::pairwise_euclidean(x1, x2).powf_scalar(2.0);
+        squared.mul_scalar(-self.gamma).exp()
+    }
+
     fn kernel(&self, x1: &Tensor<B, 1>, x2: &Tensor<B, 1>) -> f32 {
         let diff = x1.clone().sub(x2.clone());
         let squared_norm: f32 = diff.clone().mul(diff).sum().into_scalar();

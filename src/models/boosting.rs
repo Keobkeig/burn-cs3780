@@ -24,25 +24,49 @@ pub trait WeakLearner<B: Backend<FloatElem = f32>> {
 
     /// Check if the weak learner is fitted
     fn is_fitted(&self) -> bool;
+
+    /// Index of the feature this learner splits on, if it splits on exactly one.
+    ///
+    /// Used to aggregate feature importances across an ensemble.
+    fn feature_used(&self) -> Option<usize> {
+        None
+    }
 }
 
-/// Decision stump (depth-1 decision tree) implementation
+/// Decision stump: a single feature, a single threshold.
+///
+/// Fitted by exhaustive search for the split with the lowest *weighted*
+/// error, which is what AdaBoost needs — reweighting the samples has to
+/// change the stump you get, or every round returns the same learner and
+/// boosting stops after one.
 #[derive(Debug, Clone)]
 pub struct DecisionStump<B: Backend<FloatElem = f32>> {
-    /// Internal decision tree with max depth 1
-    tree: DecisionTree<B>,
+    feature_idx: usize,
+    threshold: f32,
+    /// Label predicted for `value <= threshold`.
+    below_label: f32,
+    /// Label predicted for `value > threshold`.
+    above_label: f32,
+    fitted: bool,
+    device: burn::tensor::Device<B>,
 }
 
 impl<B: Backend<FloatElem = f32>> DecisionStump<B> {
     /// Create a new decision stump
     pub fn new(device: burn::tensor::Device<B>) -> Self {
         Self {
-            tree: DecisionTree::classifier(device)
-                .with_max_depth(1) // Stump is depth 1
-                .with_min_samples_split(2)
-                .with_min_samples_leaf(1)
-                .with_criterion(SplitCriterion::Gini),
+            feature_idx: 0,
+            threshold: 0.0,
+            below_label: 0.0,
+            above_label: 0.0,
+            fitted: false,
+            device,
         }
+    }
+
+    /// The feature this stump splits on, and where.
+    pub fn split(&self) -> (usize, f32) {
+        (self.feature_idx, self.threshold)
     }
 }
 
@@ -51,17 +75,130 @@ impl<B: Backend<FloatElem = f32>> WeakLearner<B> for DecisionStump<B> {
         &mut self,
         x: &Tensor<B, 2>,
         y: &Tensor<B, 1>,
-        _weights: &Tensor<B, 1>, // Decision trees don't directly support sample weights in our implementation
+        weights: &Tensor<B, 1>,
     ) -> Result<(), String> {
-        self.tree.fit(x.clone(), y.clone())
+        let [n_samples, n_features] = x.dims();
+        let x_data = x
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|_| "Failed to convert features to vector")?;
+        let y_data = y
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|_| "Failed to convert labels to vector")?;
+        let w_data = weights
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|_| "Failed to convert weights to vector")?;
+
+        if n_samples == 0 {
+            return Err("No training samples provided".to_string());
+        }
+
+        let mut classes = y_data.clone();
+        classes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        classes.dedup();
+
+        let total_weight: f32 = w_data.iter().sum();
+        let mut best: Option<(f32, usize, f32, f32, f32)> = None;
+
+        for feature in 0..n_features {
+            let mut values: Vec<f32> = (0..n_samples)
+                .map(|i| x_data[i * n_features + feature])
+                .collect();
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            values.dedup();
+
+            // Midpoints between adjacent distinct values, plus one split that
+            // sends everything to the "above" side.
+            let mut thresholds: Vec<f32> = values.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+            if thresholds.is_empty() {
+                thresholds.push(values.first().copied().unwrap_or(0.0) - 1.0);
+            }
+
+            for &threshold in &thresholds {
+                // Weighted class mass on each side of the split.
+                let mut below = vec![0.0f32; classes.len()];
+                let mut above = vec![0.0f32; classes.len()];
+                for i in 0..n_samples {
+                    let class = classes
+                        .iter()
+                        .position(|c| (c - y_data[i]).abs() < 1e-6)
+                        .unwrap_or(0);
+                    if x_data[i * n_features + feature] <= threshold {
+                        below[class] += w_data[i];
+                    } else {
+                        above[class] += w_data[i];
+                    }
+                }
+
+                let pick = |mass: &[f32]| {
+                    let mut best_class = 0;
+                    for (i, &m) in mass.iter().enumerate() {
+                        if m > mass[best_class] {
+                            best_class = i;
+                        }
+                    }
+                    (classes[best_class], mass[best_class])
+                };
+                let (below_label, below_correct) = pick(&below);
+                let (above_label, above_correct) = pick(&above);
+
+                // Whatever the majority side does not cover is error.
+                let error = (total_weight - below_correct - above_correct).max(0.0);
+                if best.map_or(true, |(b, ..)| error < b) {
+                    best = Some((error, feature, threshold, below_label, above_label));
+                }
+            }
+        }
+
+        let (_, feature, threshold, below_label, above_label) =
+            best.ok_or("No usable split found")?;
+        self.feature_idx = feature;
+        self.threshold = threshold;
+        self.below_label = below_label;
+        self.above_label = above_label;
+        self.fitted = true;
+        Ok(())
     }
 
     fn predict(&self, x: &Tensor<B, 2>) -> Result<Tensor<B, 1>, String> {
-        self.tree.predict(x.clone())
+        if !self.fitted {
+            return Err("Stump must be fitted before prediction".to_string());
+        }
+
+        let [n_samples, n_features] = x.dims();
+        let x_data = x
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|_| "Failed to convert features to vector")?;
+
+        let predictions: Vec<f32> = (0..n_samples)
+            .map(|i| {
+                if x_data[i * n_features + self.feature_idx] <= self.threshold {
+                    self.below_label
+                } else {
+                    self.above_label
+                }
+            })
+            .collect();
+
+        Ok(Tensor::from_data(
+            TensorData::new(predictions, [n_samples]),
+            &self.device,
+        ))
     }
 
     fn is_fitted(&self) -> bool {
-        self.tree.is_fitted()
+        self.fitted
+    }
+
+    fn feature_used(&self) -> Option<usize> {
+        Some(self.feature_idx)
     }
 }
 
@@ -101,6 +238,8 @@ pub struct AdaBoostClassifier<B: Backend<FloatElem = f32>> {
     classes: Vec<i32>,
     /// Number of classes
     n_classes: usize,
+    /// Number of features seen during training
+    n_features: usize,
     /// Whether the model is fitted
     is_fitted: bool,
 }
@@ -114,6 +253,7 @@ impl<B: Backend<FloatElem = f32>> AdaBoostClassifier<B> {
             estimator_weights: Vec::new(),
             classes: Vec::new(),
             n_classes: 0,
+            n_features: 0,
             is_fitted: false,
         }
     }
@@ -166,6 +306,8 @@ impl<B: Backend<FloatElem = f32>> AdaBoostClassifier<B> {
         if self.n_classes < 2 {
             return Err("Need at least 2 classes for classification".to_string());
         }
+
+        self.n_features = x.dims()[1];
 
         // Initialize sample weights uniformly
         let mut sample_weights = vec![1.0 / n_samples as f32; n_samples];
@@ -394,9 +536,23 @@ impl<B: Backend<FloatElem = f32>> AdaBoostClassifier<B> {
             return None;
         }
 
-        // For this simple implementation, return None
-        // In practice, you'd aggregate feature importances from weak learners
-        None
+        // Total |alpha| attributed to each feature, normalized.
+        let mut importances = vec![0.0f32; self.n_features];
+        for (estimator, weight) in self.estimators.iter().zip(self.estimator_weights.iter()) {
+            if let Some(feature) = estimator.feature_used() {
+                if feature < importances.len() {
+                    importances[feature] += weight.abs();
+                }
+            }
+        }
+
+        let total: f32 = importances.iter().sum();
+        if total > 0.0 {
+            for importance in &mut importances {
+                *importance /= total;
+            }
+        }
+        Some(importances)
     }
 
     /// Check if the model is fitted
@@ -765,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_decision_stump_creation() {
-        let _stump = DecisionStump::<DefaultBackend>::new();
+        let _stump = DecisionStump::<DefaultBackend>::new(Default::default());
     }
 
     #[test]
@@ -786,10 +942,12 @@ mod tests {
 
         // Simple binary classification dataset
         let x_data = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0];
-        let y_data = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        // 4 samples of 2 features, so 4 labels — this was 8, which cannot be
+        // shaped [4].
+        let y_data = vec![0.0, 0.0, 1.0, 1.0];
 
-        let x = Tensor::from_floats(TensorData::new(x_data, [4, 2]), &device);
-        let y = Tensor::from_floats(TensorData::new(y_data, [4]), &device);
+        let x = Tensor::<DefaultBackend, 2>::from_floats(TensorData::new(x_data, [4, 2]), &device);
+        let y = Tensor::<DefaultBackend, 1>::from_floats(TensorData::new(y_data, [4]), &device);
 
         let config = AdaBoostConfig {
             n_estimators: 3,
@@ -809,10 +967,12 @@ mod tests {
 
         // Simple binary classification dataset
         let x_data = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0];
-        let y_data = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        // 4 samples of 2 features, so 4 labels — this was 8, which cannot be
+        // shaped [4].
+        let y_data = vec![0.0, 0.0, 1.0, 1.0];
 
-        let x = Tensor::from_floats(TensorData::new(x_data, [4, 2]), &device);
-        let y = Tensor::from_floats(TensorData::new(y_data, [4]), &device);
+        let x = Tensor::<DefaultBackend, 2>::from_floats(TensorData::new(x_data, [4, 2]), &device);
+        let y = Tensor::<DefaultBackend, 1>::from_floats(TensorData::new(y_data, [4]), &device);
 
         let config = GradientBoostingConfig {
             n_estimators: 3,

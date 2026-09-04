@@ -24,7 +24,11 @@ impl MathUtils {
 
     /// Leaky ReLU activation function
     pub fn leaky_relu(x: f32, alpha: f32) -> f32 {
-        if x >= 0.0 { x } else { alpha * x }
+        if x >= 0.0 {
+            x
+        } else {
+            alpha * x
+        }
     }
 
     /// Tanh activation function
@@ -44,6 +48,56 @@ impl MathUtils {
                 encoding
             })
             .collect()
+    }
+
+    /// Solve `Ax = b` by Gauss-Jordan elimination with partial pivoting.
+    ///
+    /// `a` is row-major `n x n`. Returns `None` if the matrix is singular, so
+    /// the caller can fall back to an iterative solver.
+    pub fn solve_linear_system(a: &[f32], b: &[f32], n: usize) -> Option<Vec<f32>> {
+        // Augmented matrix, n rows of n + 1 columns.
+        let w = n + 1;
+        let mut m = vec![0.0f32; n * w];
+        for row in 0..n {
+            m[row * w..row * w + n].copy_from_slice(&a[row * n..row * n + n]);
+            m[row * w + n] = b[row];
+        }
+
+        for col in 0..n {
+            let mut pivot = col;
+            for row in col + 1..n {
+                if m[row * w + col].abs() > m[pivot * w + col].abs() {
+                    pivot = row;
+                }
+            }
+            if m[pivot * w + col].abs() < 1e-10 {
+                return None;
+            }
+            if pivot != col {
+                for k in 0..w {
+                    m.swap(col * w + k, pivot * w + k);
+                }
+            }
+
+            let diagonal = m[col * w + col];
+            for k in col..w {
+                m[col * w + k] /= diagonal;
+            }
+            for row in 0..n {
+                if row == col {
+                    continue;
+                }
+                let factor = m[row * w + col];
+                if factor == 0.0 {
+                    continue;
+                }
+                for k in col..w {
+                    m[row * w + k] -= factor * m[col * w + k];
+                }
+            }
+        }
+
+        Some((0..n).map(|row| m[row * w + n]).collect())
     }
 
     /// Sample from a categorical distribution

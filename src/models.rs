@@ -6,6 +6,7 @@
 pub mod autoencoders;
 pub mod boosting;
 pub mod clustering;
+pub mod cnn;
 pub mod decision_tree;
 pub mod knn;
 pub mod linear_models;
@@ -22,6 +23,7 @@ pub mod transformers;
 pub use autoencoders::*;
 pub use boosting::*;
 pub use clustering::*;
+pub use cnn::*;
 pub use decision_tree::*;
 pub use knn::*;
 pub use linear_models::*;

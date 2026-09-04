@@ -3,59 +3,60 @@ name = "burn-cs3780"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "main"
 path = "src/main.rs"
 
-# Example binaries for each topic
-# Note: Only add binary targets for examples that actually exist
-
-# Placeholder for future examples - uncomment when files are created
-# [[bin]]
-# name = "decision_trees_example" 
-# path = "examples/02_decision_trees/main.rs"
-
 [dependencies]
-# Core Burn dependencies
-burn = { version = "0.20", features = ["ndarray", "wgpu", "std", "train"] }
+# Shared by native and wasm builds
+rand = "0.8"
+rand_distr = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+burn = { version = "0.20", features = ["ndarray", "wgpu", "std", "train", "autodiff"] }
 burn-core = "0.20"
 burn-ndarray = "0.20"
 burn-wgpu = "0.20"
 burn-train = "0.20"
 burn-dataset = "0.20"
 
-# Data handling and visualization
 ndarray = "0.16"
 csv = "1.3"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Math and statistics
-rand = "0.8"
-rand_distr = "0.4"
 nalgebra = "0.33"
-
-# Plotting and visualization (for examples)
 plotters = "0.3"
 image = "0.25"
-
-# Utility
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
-# Web deployment features
+# Slim browser build: CPU tensors + autodiff only. No wgpu, no dataset
+# (sqlite), no plotters/image/clap — none of them compile to wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+burn = { version = "0.20", default-features = false, features = [
+    "std",
+    "ndarray",
+    "autodiff",
+] }
 wasm-bindgen = "0.2"
-web-sys = "0.3"
 js-sys = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
+# burn pulls rand 0.9, which needs getrandom 0.3 with its wasm backend.
+getrandom_v3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# Turns a wasm trap into a readable panic message in the console.
+console_error_panic_hook = "0.1"
 
 [features]
-default = ["std"]
-std = ["burn/std"]
-wasm-web = ["burn/wgpu"]
+default = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
-
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

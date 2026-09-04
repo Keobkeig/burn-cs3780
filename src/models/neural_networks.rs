@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn test_mlp_creation() {
         let device = TestDevice::default();
-        let mlp = MLP::new(4, vec![10, 5], 3, &device);
+        let mlp = MLP::<DefaultBackend>::new(4, vec![10, 5], 3, &device);
 
         assert_eq!(mlp.input_dim(), 4);
         assert_eq!(mlp.output_dim(), 3);
@@ -545,5 +545,67 @@ mod tests {
         let result = regressor.fit(&x, &y);
         assert!(result.is_ok());
         assert!(regressor.is_fitted());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backprop training
+//
+// `NeuralNetClassifier::fit` only initializes the network — it never had a
+// gradient step. This block adds real training, gated on an autodiff backend
+// so the plain `Backend` API above is unchanged.
+// ---------------------------------------------------------------------------
+
+impl<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>> NeuralNetClassifier<B> {
+    /// Train the network with backpropagation.
+    ///
+    /// Returns the mean cross-entropy loss after every epoch. Full-batch
+    /// gradient descent with Adam — fine for the small 2D problems this is
+    /// used on, and it keeps the loop short enough to run inside a browser
+    /// animation frame.
+    ///
+    /// # Arguments
+    /// * `x` - Features, shape [n_samples, input_dim]
+    /// * `y` - Class indices as floats, shape [n_samples]
+    /// * `epochs` - Number of full-batch passes
+    /// * `lr` - Adam learning rate
+    pub fn fit_backprop(
+        &mut self,
+        x: &Tensor<B, 2>,
+        y: &Tensor<B, 1>,
+        epochs: usize,
+        lr: f64,
+    ) -> Result<Vec<f32>, String> {
+        use burn::nn::loss::CrossEntropyLossConfig;
+        use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+
+        if x.dims()[0] == 0 {
+            return Err("No training samples provided".to_string());
+        }
+
+        let mut model = MLP::new(
+            self.input_dim,
+            self.hidden_layers.clone(),
+            self.num_classes,
+            &self.device,
+        );
+        let targets = y.clone().int();
+        let loss_fn = CrossEntropyLossConfig::new().init(&self.device);
+        let mut optimizer = AdamConfig::new().init();
+        let mut history = Vec::with_capacity(epochs);
+
+        let hidden_activation = self.training_config.hidden_activation;
+        for _ in 0..epochs {
+            let logits = model.forward(x.clone(), hidden_activation, Activation::Linear);
+            let loss = loss_fn.forward(logits, targets.clone());
+            history.push(loss.clone().into_scalar());
+
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            model = optimizer.step(lr, model, grads);
+        }
+
+        self.model = Some(model);
+        self.is_fitted = true;
+        Ok(history)
     }
 }

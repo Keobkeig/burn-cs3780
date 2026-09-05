@@ -101,11 +101,18 @@ impl<B: Backend<FloatElem = f32>> PCA<B> {
     /// use burn_cs3780::{models::PCA, DefaultBackend};
     /// use burn::tensor::{Tensor, TensorData};
     ///
+    /// let device = Default::default();
     /// let data = Tensor::<DefaultBackend, 2>::from_data(
-    ///     TensorData::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])
+    ///     TensorData::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 7.0], [3, 2]),
+    ///     &device,
     /// );
-    /// let mut pca = PCA::new(Some(2), true, false);
-    /// let result = pca.fit(&data);
+    ///
+    /// let mut pca = PCA::<DefaultBackend>::new(Some(2), true, false);
+    /// pca.fit(&data).unwrap();
+    ///
+    /// // Ratios are normalized, so they sum to 1.
+    /// let ratios = pca.explained_variance_ratio().unwrap();
+    /// assert_eq!(ratios.dims(), [2]);
     /// ```
     pub fn fit(&mut self, x: &Tensor<B, 2>) -> Result<(), String> {
         let dims = x.dims();

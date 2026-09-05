@@ -5,14 +5,12 @@
 
 pub mod linear;
 pub mod polynomial;
-pub mod precomputed;
 pub mod rbf;
 pub mod sigmoid;
 pub mod utils;
 
 pub use linear::LinearKernel;
 pub use polynomial::PolynomialKernel;
-pub use precomputed::PrecomputedKernel;
 pub use rbf::RbfKernel;
 pub use sigmoid::SigmoidKernel;
 pub use utils::{KernelRidge, KernelUtils};

@@ -160,7 +160,8 @@ fn test_distance_metrics(
             train_data.labels.clone().squeeze::<1>(),
         );
         let predictions = knn.predict(&test_data.features);
-        let accuracy = ClassificationMetrics::accuracy(&test_data.labels.clone().squeeze::<1>(), &predictions);
+        let accuracy =
+            ClassificationMetrics::accuracy(&test_data.labels.clone().squeeze::<1>(), &predictions);
 
         println!("{}\t\t{:.4}", name, accuracy);
     }
@@ -191,7 +192,8 @@ fn test_weight_functions(
             train_data.labels.clone().squeeze::<1>(),
         );
         let predictions = knn.predict(&test_data.features);
-        let accuracy = ClassificationMetrics::accuracy(&test_data.labels.clone().squeeze::<1>(), &predictions);
+        let accuracy =
+            ClassificationMetrics::accuracy(&test_data.labels.clone().squeeze::<1>(), &predictions);
 
         println!("{}\t{:.4}", name, accuracy);
     }

@@ -6,14 +6,20 @@
  * the wasm bundle, then written as a PNG by hand so this needs no image
  * dependency.
  *
+ * Defaults to the sibling portfolio checkout.
+ *
  *   bun make-thumbnail.mjs [out.png]
+ *   BURN_WASM_OUT=/path/to/wasm bun make-thumbnail.mjs /path/to/out.png
  */
 import { deflateSync } from 'node:zlib';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const WASM = '/Users/Programming/richie-portfolio/static/wasm/burn';
-const OUT = process.argv[2] ?? '/Users/Programming/richie-portfolio/static/projects/burn-cs3780.png';
+const repo = dirname(fileURLToPath(import.meta.url));
+const portfolio = resolve(repo, '..', 'richie-portfolio');
+const WASM = process.env.BURN_WASM_OUT ?? resolve(portfolio, 'static', 'wasm', 'burn');
+const OUT = process.argv[2] ?? resolve(portfolio, 'static', 'projects', 'burn-cs3780.png');
 
 const burn = await import(pathToFileURL(`${WASM}/burn.js`).href);
 await burn.default({ module_or_path: readFileSync(`${WASM}/burn_bg.wasm`) });

@@ -19,7 +19,12 @@ impl RegressionMetrics {
 
     /// Calculate Mean Absolute Error (MAE)
     pub fn mae<B: Backend<FloatElem = f32>>(y_true: &Tensor<B, 1>, y_pred: &Tensor<B, 1>) -> f32 {
-        y_true.clone().sub(y_pred.clone()).abs().mean().into_scalar()
+        y_true
+            .clone()
+            .sub(y_pred.clone())
+            .abs()
+            .mean()
+            .into_scalar()
     }
 
     /// Calculate R-squared (coefficient of determination)

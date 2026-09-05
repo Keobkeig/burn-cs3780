@@ -2,13 +2,19 @@
  * Smoke test for the browser bundle: load it the way the page does and check
  * every binding returns something with the right shape and sane values.
  *
+ * Defaults to the sibling portfolio checkout that build-wasm.sh writes to.
+ *
  *   bun test-wasm.mjs [path/to/static/wasm/burn]
+ *   BURN_WASM_OUT=/path/to/out bun test-wasm.mjs
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const dir = process.argv[2] ?? '/Users/Programming/richie-portfolio/static/wasm/burn';
+const repo = dirname(fileURLToPath(import.meta.url));
+const defaultDir = resolve(repo, '..', 'richie-portfolio', 'static', 'wasm', 'burn');
+const dir = process.argv[2] ?? process.env.BURN_WASM_OUT ?? defaultDir;
 const burn = await import(pathToFileURL(`${dir}/burn.js`).href);
 await burn.default({ module_or_path: readFileSync(`${dir}/burn_bg.wasm`) });
 

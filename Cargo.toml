@@ -2,6 +2,9 @@
 name = "burn-cs3780"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Machine learning algorithms from CS3780, implemented on the Burn framework and compilable to WebAssembly"
+repository = "https://github.com/Keobkeig/burn-cs3780"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "burn-cs3780")]
-#[command(about = "A comprehensive machine learning library implementing CS3780 concepts using Burn")]
+#[command(
+    about = "A comprehensive machine learning library implementing CS3780 concepts using Burn"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

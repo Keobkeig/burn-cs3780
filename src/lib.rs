@@ -1,59 +1,53 @@
-//! # Burn CS3780: Machine Learning Framework
+//! # burn-cs3780
 //!
-//! A comprehensive machine learning library implementing all CS3780 concepts using the Burn framework.
-//! This library provides implementations of classical machine learning algorithms, deep learning models,
-//! and optimization techniques with a focus on performance, correctness, and educational value.
+//! Machine learning algorithms from Cornell's CS 3780, implemented from
+//! scratch on the [Burn](https://burn.dev) tensor framework and compilable to
+//! WebAssembly.
 //!
-//! ## Features
+//! ## What's here
 //!
-//! ### Classical Machine Learning
-//! - k-Nearest Neighbors (k-NN)
-//! - Decision Trees
-//! - Linear and Logistic Regression
-//! - Perceptron Algorithm
-//! - Support Vector Machines (SVM)
-//! - Kernel Methods
+//! **Supervised** — k-nearest neighbors, decision trees, linear and logistic
+//! regression (ridge / lasso / elastic net), perceptron (binary and
+//! one-vs-rest), support vector machines via SMO, naive Bayes for text,
+//! AdaBoost, and gradient boosting with optional row subsampling.
 //!
-//! ### Deep Learning
-//! - Neural Networks (MLPs)
-//! - Convolutional Neural Networks (CNNs)
-//! - Recurrent Neural Networks (RNNs)
-//! - Transformers
-//! - Autoencoders
+//! **Neural** — multilayer perceptrons, convolutional networks, autoencoders
+//! (plain, variational, denoising, sparse), a transformer encoder and
+//! classifier, and a character-level language model with causal masking.
 //!
-//! ### Ensemble Methods
-//! - Boosting (AdaBoost, Gradient Boosting)
-//! - Random Forests
+//! **Unsupervised** — k-means (random or k-means++ seeding), PCA by power
+//! iteration, and kernel ridge regression.
 //!
-//! ### Unsupervised Learning
-//! - k-Means Clustering
-//! - Principal Component Analysis (PCA)
-//! - t-SNE
+//! **Supporting** — linear / polynomial / RBF / sigmoid kernels, SGD / Adam /
+//! AdaGrad with step and exponential schedules, three online learners,
+//! classification and regression metrics, preprocessing, and synthetic
+//! dataset generators.
 //!
-//! ### Optimization & Training
-//! - Gradient Descent variants (SGD, Adam, AdaGrad)
-//! - Online Learning algorithms
-//! - Cross-validation
-//! - Regularization techniques
+//! Not implemented, despite being adjacent to the syllabus: recurrent networks,
+//! random forests, t-SNE, RMSprop, cosine annealing, early stopping, and
+//! cross-validation beyond k-fold index generation.
 //!
-//! ## Backend Support
+//! ## Backends
 //!
-//! Thanks to Burn's flexible backend system, all algorithms can run on:
-//! - CPU (NdArray backend)
-//! - GPU (WGPU backend)  
-//! - WebAssembly (for browser deployment)
+//! Where a tensor computes is a type parameter, so every model is written once
+//! and runs on CPU ([`DefaultBackend`]), GPU ([`GpuBackend`], via wgpu) or with
+//! gradients ([`DefaultAutodiffBackend`]). The WebAssembly build is the same
+//! source with the CPU backend selected.
 //!
-//! ## Example Usage
+//! ## Example
 //!
 //! ```rust
 //! use burn_cs3780::models::KNearestNeighbors;
-//! use burn::backend::NdArray;
+//! use burn_cs3780::{datasets, DefaultBackend};
 //!
-//! type Backend = NdArray<f32>;
+//! let device = Default::default();
+//! let data = datasets::make_blobs::<DefaultBackend>(60, 3, 0.8, &device, Some(42));
 //!
-//! // Create and train a k-NN classifier
-//! let knn = KNearestNeighbors::<Backend>::new(5);
-//! // ... training and inference code
+//! let mut knn = KNearestNeighbors::<DefaultBackend>::new(5);
+//! knn.fit(data.features.clone(), data.labels.squeeze_dims::<1>(&[1]));
+//!
+//! let predictions = knn.predict(&data.features);
+//! assert_eq!(predictions.dims()[0], 60);
 //! ```
 
 #![warn(missing_docs)]

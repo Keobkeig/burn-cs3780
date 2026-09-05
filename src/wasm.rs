@@ -789,7 +789,6 @@ pub fn adaboost_boundary(
     let mut model = AdaBoostClassifier::<Bk>::new(AdaBoostConfig {
         n_estimators: n_estimators.max(1),
         learning_rate: lr,
-        random_seed: Some(0),
     });
     model.fit(&x, &y).map_err(|e| JsError::new(&e))?;
 

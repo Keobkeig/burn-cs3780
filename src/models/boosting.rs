@@ -7,6 +7,8 @@
 
 use crate::models::decision_tree::{DecisionTree, SplitCriterion};
 use burn::tensor::{backend::Backend, Tensor, TensorData};
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use std::fmt;
 
 /// Weak learner trait for boosting algorithms
@@ -203,14 +205,16 @@ impl<B: Backend<FloatElem = f32>> WeakLearner<B> for DecisionStump<B> {
 }
 
 /// AdaBoost classifier configuration
+///
+/// There is no random seed because there is no randomness: each round fits its
+/// stump by exhaustive search for the lowest weighted error, so a given
+/// dataset and configuration always produce the same ensemble.
 #[derive(Debug, Clone)]
 pub struct AdaBoostConfig {
     /// Number of weak learners
     pub n_estimators: usize,
     /// Learning rate (step size shrinkage)
     pub learning_rate: f32,
-    /// Random seed for reproducibility
-    pub random_seed: Option<u64>,
 }
 
 impl Default for AdaBoostConfig {
@@ -218,7 +222,6 @@ impl Default for AdaBoostConfig {
         Self {
             n_estimators: 50,
             learning_rate: 1.0,
-            random_seed: None,
         }
     }
 }
@@ -721,6 +724,28 @@ impl<B: Backend<FloatElem = f32>> GradientBoostingClassifier<B> {
         // Clear previous estimators
         self.estimators.clear();
 
+        // Stochastic gradient boosting: each round fits its tree to a random
+        // subset of the rows. `subsample` and `random_seed` were previously
+        // declared and never read, so every round saw the whole dataset and no
+        // fit was reproducible.
+        let n_features = x.dims()[1];
+        let x_data = x
+            .to_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|_| "Failed to convert features to vector")?;
+
+        let subsample = self.config.subsample.clamp(0.0, 1.0);
+        let rows_per_round = if subsample >= 1.0 {
+            n_samples
+        } else {
+            ((n_samples as f32 * subsample).round() as usize).clamp(1, n_samples)
+        };
+        let mut rng = match self.config.random_seed {
+            Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
+            None => rand::rngs::StdRng::from_entropy(),
+        };
+
         // Gradient boosting iterations
         for _m in 0..self.config.n_estimators {
             // Compute pseudo-residuals (negative gradients)
@@ -745,11 +770,35 @@ impl<B: Backend<FloatElem = f32>> GradientBoostingClassifier<B> {
                 .with_min_samples_leaf(self.config.min_samples_leaf)
                 .with_criterion(SplitCriterion::MSE); // Use MSE for regression on residuals
 
-            let residuals_tensor =
-                Tensor::from_floats(TensorData::new(residuals, [n_samples]), &x.device());
+            // Fit the tree on a subsample, but score every row: the model has
+            // to move all predictions, not just the sampled ones.
+            let (fit_x, fit_residuals) = if rows_per_round == n_samples {
+                (
+                    x.clone(),
+                    Tensor::from_floats(TensorData::new(residuals, [n_samples]), &x.device()),
+                )
+            } else {
+                let mut indices: Vec<usize> = (0..n_samples).collect();
+                indices.shuffle(&mut rng);
+                indices.truncate(rows_per_round);
 
-            // Fit tree to residuals
-            tree.fit(x.clone(), residuals_tensor)?;
+                let mut rows = Vec::with_capacity(rows_per_round * n_features);
+                let mut targets = Vec::with_capacity(rows_per_round);
+                for &i in &indices {
+                    rows.extend_from_slice(&x_data[i * n_features..(i + 1) * n_features]);
+                    targets.push(residuals[i]);
+                }
+
+                (
+                    Tensor::from_floats(
+                        TensorData::new(rows, [rows_per_round, n_features]),
+                        &x.device(),
+                    ),
+                    Tensor::from_floats(TensorData::new(targets, [rows_per_round]), &x.device()),
+                )
+            };
+
+            tree.fit(fit_x, fit_residuals)?;
 
             // Get tree predictions
             let tree_predictions = tree.predict(x.clone())?;
@@ -952,13 +1001,90 @@ mod tests {
         let config = AdaBoostConfig {
             n_estimators: 3,
             learning_rate: 1.0,
-            random_seed: Some(42),
         };
 
         let mut classifier = AdaBoostClassifier::new(config);
         let result = classifier.fit(&x, &y);
         assert!(result.is_ok(), "AdaBoost fit should succeed");
         assert!(classifier.is_fitted());
+    }
+
+    /// Build a separable-ish binary problem big enough for subsampling to
+    /// mean something.
+    fn boosting_fixture() -> (Tensor<DefaultBackend, 2>, Tensor<DefaultBackend, 1>) {
+        let device = Default::default();
+        let n = 60;
+        let mut xs = Vec::with_capacity(n * 2);
+        let mut ys = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / n as f32;
+            let positive = i % 2 == 0;
+            xs.push(if positive { t } else { -t });
+            xs.push(if positive { -t } else { t });
+            ys.push(if positive { 1.0 } else { 0.0 });
+        }
+        (
+            Tensor::<DefaultBackend, 2>::from_floats(TensorData::new(xs, [n, 2]), &device),
+            Tensor::<DefaultBackend, 1>::from_floats(TensorData::new(ys, [n]), &device),
+        )
+    }
+
+    #[test]
+    fn gradient_boosting_seed_makes_subsampling_reproducible() {
+        let (x, y) = boosting_fixture();
+
+        let fit_with = |seed: Option<u64>| {
+            let mut model =
+                GradientBoostingClassifier::<DefaultBackend>::new(GradientBoostingConfig {
+                    n_estimators: 6,
+                    subsample: 0.5,
+                    random_seed: seed,
+                    ..Default::default()
+                });
+            model.fit(&x, &y).expect("fit should succeed");
+            model
+                .decision_function(&x)
+                .expect("decision_function should succeed")
+                .to_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .expect("read scores")
+        };
+
+        // The same seed must reproduce the same ensemble exactly.
+        assert_eq!(fit_with(Some(7)), fit_with(Some(7)));
+        // A different seed draws different subsets, so the scores must differ.
+        assert_ne!(fit_with(Some(7)), fit_with(Some(99)));
+    }
+
+    #[test]
+    fn gradient_boosting_subsample_changes_the_fit() {
+        let (x, y) = boosting_fixture();
+
+        let fit_with = |subsample: f32| {
+            let mut model =
+                GradientBoostingClassifier::<DefaultBackend>::new(GradientBoostingConfig {
+                    n_estimators: 6,
+                    subsample,
+                    random_seed: Some(3),
+                    ..Default::default()
+                });
+            model.fit(&x, &y).expect("fit should succeed");
+            model
+                .decision_function(&x)
+                .expect("decision_function should succeed")
+                .to_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .expect("read scores")
+        };
+
+        // subsample was declared and never read, so this used to hold trivially.
+        assert_ne!(
+            fit_with(1.0),
+            fit_with(0.4),
+            "subsampling must actually change which rows each tree sees"
+        );
     }
 
     #[test]

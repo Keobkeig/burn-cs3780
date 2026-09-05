@@ -127,6 +127,32 @@ impl<B: Backend<FloatElem = f32>> Autoencoder<B> {
         input
     }
 
+    /// Encode, returning the post-activation output of every hidden layer
+    /// alongside the latent code.
+    ///
+    /// The latent layer itself is excluded: it has no activation applied, and
+    /// a sparsity penalty on the bottleneck would fight the reconstruction
+    /// objective rather than encourage selective hidden units.
+    pub fn encode_with_activations(
+        &self,
+        mut input: Tensor<B, 2>,
+        activation: ActivationType,
+    ) -> (Tensor<B, 2>, Vec<Tensor<B, 2>>) {
+        let mut hidden = Vec::with_capacity(self.encoder_layers.len().saturating_sub(1));
+
+        for (i, layer) in self.encoder_layers.iter().enumerate() {
+            input = layer.forward(input);
+
+            if i < self.encoder_layers.len() - 1 {
+                input = self.apply_activation(input, activation);
+                hidden.push(input.clone());
+                input = self.dropout.forward(input);
+            }
+        }
+
+        (input, hidden)
+    }
+
     /// Decode latent representation to output
     pub fn decode(&self, mut latent: Tensor<B, 2>, activation: ActivationType) -> Tensor<B, 2> {
         for (i, layer) in self.decoder_layers.iter().enumerate() {
@@ -621,18 +647,15 @@ impl<B: Backend<FloatElem = f32>> SparseAutoencoder<B> {
         self.autoencoder.forward(input, activation)
     }
 
-    /// Encode to latent space with activation tracking
+    /// Encode to latent space, returning each hidden layer's activations.
+    ///
+    /// These are what the sparsity penalty acts on, so they have to be real.
     pub fn encode(
         &self,
         input: Tensor<B, 2>,
         activation: ActivationType,
     ) -> (Tensor<B, 2>, Vec<Tensor<B, 2>>) {
-        // For now, use the standard encode and return empty activations
-        // This is a limitation of the current structure - we'd need to refactor
-        // the base autoencoder to expose intermediate activations
-        let latent = self.autoencoder.encode(input, activation);
-        let activations = Vec::new(); // Empty for now
-        (latent, activations)
+        self.autoencoder.encode_with_activations(input, activation)
     }
 
     /// Decode from latent space
@@ -641,37 +664,71 @@ impl<B: Backend<FloatElem = f32>> SparseAutoencoder<B> {
     }
 
     /// Compute sparse autoencoder loss (reconstruction + sparsity)
+    /// Reconstruction loss plus a KL sparsity penalty on the hidden units.
+    ///
+    /// For each hidden unit, `rho_hat` is its mean activation over the batch
+    /// and the penalty is `KL(rho || rho_hat)`, which is zero when a unit fires
+    /// at exactly the target rate and grows steeply as it saturates on or off:
+    ///
+    /// ```text
+    /// KL = rho * ln(rho / rho_hat) + (1 - rho) * ln((1 - rho) / (1 - rho_hat))
+    /// ```
+    ///
+    /// This is what `sparsity_target` means, and why it is a rate rather than
+    /// a magnitude. An L1 penalty would only push activations toward zero;
+    /// KL pushes them toward *being selective*.
     pub fn sparse_loss(
         &self,
         input: Tensor<B, 2>,
         reconstruction: Tensor<B, 2>,
         activations: &[Tensor<B, 2>],
         sparsity_weight: f32,
-        _sparsity_target: f32,
+        sparsity_target: f32,
     ) -> Tensor<B, 1> {
-        // Reconstruction loss
         let recon_loss = self
             .autoencoder
             .reconstruction_loss(input, reconstruction.clone());
 
-        // Sparsity loss (KL divergence between average activation and target)
         let mut sparsity_loss =
             Tensor::from_floats(TensorData::new(vec![0.0], [1]), &reconstruction.device());
 
-        for activation in activations {
-            // Average activation across batch
-            let avg_activation = activation.clone().mean_dim(0);
+        // Keep rho strictly inside (0, 1) so neither logarithm can blow up.
+        let rho = sparsity_target.clamp(1e-4, 1.0 - 1e-4);
+        let epsilon = 1e-6;
 
-            // Simple L1 sparsity penalty instead of KL divergence for now
-            let sparsity_penalty = avg_activation.abs().mean();
-            sparsity_loss = sparsity_loss + sparsity_penalty;
+        for activation in activations {
+            let units = activation.dims()[1];
+            // Mean activation per unit, over the batch.
+            let rho_hat = activation
+                .clone()
+                .mean_dim(0)
+                .reshape([units])
+                .clamp(epsilon, 1.0 - epsilon);
+
+            let term_on = rho_hat
+                .clone()
+                .recip()
+                .mul_scalar(rho)
+                .log()
+                .mul_scalar(rho);
+            let term_off = rho_hat
+                .neg()
+                .add_scalar(1.0)
+                .recip()
+                .mul_scalar(1.0 - rho)
+                .log()
+                .mul_scalar(1.0 - rho);
+
+            sparsity_loss = sparsity_loss + (term_on + term_off).sum();
         }
 
-        // Total loss
         recon_loss + sparsity_loss * sparsity_weight
     }
 
-    /// Get sparsity statistics for monitoring
+    /// Mean activation rate of each hidden layer, for monitoring.
+    ///
+    /// Compare against `sparsity_target`: a well-trained sparse autoencoder
+    /// sits near it.
     pub fn sparsity_stats(&self, activations: &[Tensor<B, 2>]) -> Vec<f32> {
         activations
             .iter()
@@ -884,15 +941,65 @@ mod tests {
         let stats = sparse_ae.sparsity_stats(&activations);
         assert_eq!(stats.len(), activations.len());
 
-        // `encode` is hardcoded to return no intermediate activations
-        // (see SparseAutoencoder::encode), so the sparsity penalty is computed
-        // over an empty slice and `sparsity_target` / `sparsity_beta` are
-        // dead config. This asserts the current behaviour rather than the
-        // intended behaviour; the original test asserted the latter and could
-        // never have passed.
+        // One entry per hidden layer, each [batch, units].
+        assert_eq!(activations.len(), 1);
+        assert_eq!(activations[0].dims(), [1, 8]);
+    }
+
+    #[test]
+    fn sparsity_penalty_responds_to_the_target() {
+        let device = Device::<TestBackend>::default();
+        let config = SparseAutoencoderConfig {
+            base_config: AutoencoderConfig {
+                input_dim: 6,
+                hidden_dims: vec![4],
+                latent_dim: 2,
+                dropout_rate: 0.0,
+                ..Default::default()
+            },
+            sparsity_weight: 1.0,
+            sparsity_target: 0.05,
+            sparsity_beta: 3.0,
+        };
+
+        let model = SparseAutoencoder::<DefaultBackend>::new(config, device.clone());
+        let input = Tensor::<DefaultBackend, 2>::from_floats(
+            TensorData::new(vec![0.2, 0.4, 0.6, 0.8, 1.0, 0.1], [1, 6]),
+            &device,
+        );
+
+        let (latent, activations) = model.encode(input.clone(), ActivationType::Sigmoid);
+        assert_eq!(latent.dims(), [1, 2]);
         assert!(
-            activations.is_empty(),
-            "if this fails, sparse activations were implemented — restore the real assertions"
+            !activations.is_empty(),
+            "the sparsity penalty needs real activations to act on"
+        );
+
+        let reconstruction = model.decode(latent, ActivationType::Sigmoid);
+
+        // KL(rho || rho_hat) is minimized when the mean activation equals the
+        // target, so scoring the same activations against their own mean must
+        // cost less than scoring them against a far-away target.
+        let stats = model.sparsity_stats(&activations);
+        let observed = stats[0];
+
+        let at = |target: f32| -> f32 {
+            model
+                .sparse_loss(
+                    input.clone(),
+                    reconstruction.clone(),
+                    &activations,
+                    1.0,
+                    target,
+                )
+                .into_scalar()
+        };
+
+        let far = if observed > 0.5 { 0.01 } else { 0.99 };
+        assert!(
+            at(observed) < at(far),
+            "penalty at the observed rate ({}) should be below the penalty at {far}",
+            observed
         );
     }
 
